@@ -119,6 +119,37 @@ add_library(hwy_target_probe STATIC tools/hwy_target.cpp)
 target_link_libraries(hwy_target_probe PUBLIC hwy)
 target_compile_options(hwy_target_probe PRIVATE -Wno-error)
 
+# --- WP-1: columnar core + SIMD layer ---------------------------------------
+# qe_simd is the ONLY place Highway appears in the engine. The vector kernels and
+# the aligned allocator include third-party Highway template headers, so those
+# TUs (and only those) opt out of -Werror; the scalar twins keep the full gate.
+add_library(qe_simd STATIC
+  simd/aligned_alloc.cpp
+  simd/validity_kernels.cpp
+  simd/validity_scalar.cpp
+  simd/gather_kernels.cpp
+  simd/gather_scalar.cpp)
+target_link_libraries(qe_simd PUBLIC hwy)
+set_source_files_properties(
+  simd/aligned_alloc.cpp
+  simd/validity_kernels.cpp
+  simd/gather_kernels.cpp
+  PROPERTIES COMPILE_OPTIONS "-Wno-error")
+
+# qe_core is the columnar format: Buffer + OwnedColumn/OwnedBatch + compaction.
+# It pulls in NO Highway headers directly (it goes through qe_simd), keeping the
+# from-scratch grep clean; it links qe_simd PUBLIC so dependents get both.
+add_library(qe_core STATIC
+  core/buffer.cpp
+  core/owned_batch.cpp)
+target_link_libraries(qe_core PUBLIC qe_simd)
+
+# Test-only planted mutants of the vector kernels (see the mutation self-test).
+# NOT linked into any engine target. Highway TU => -Wno-error.
+add_library(qe_validity_mutants STATIC simd/validity_kernels_mutants.cpp)
+target_link_libraries(qe_validity_mutants PUBLIC hwy)
+target_compile_options(qe_validity_mutants PRIVATE -Wno-error)
+
 # Drivers.
 add_executable(host_state bench/host_state_main.cpp)
 target_link_libraries(host_state PRIVATE bench_infra hwy_target_probe)
@@ -156,3 +187,24 @@ target_link_libraries(coord_omission_selftest_test PRIVATE doctest bench_infra)
 add_test(NAME coord_omission_selftest_test COMMAND coord_omission_selftest_test)
 # Wall-clock self-test (~5s; several-fold longer under sanitizers).
 set_tests_properties(coord_omission_selftest_test PROPERTIES TIMEOUT 120)
+
+# --- WP-1 tests. Each uses tests/wp1_test_main.cpp (prints seed; --seed N). ---
+add_executable(buffer_test tests/wp1_test_main.cpp tests/buffer_test.cpp)
+target_link_libraries(buffer_test PRIVATE doctest qe_core)
+add_test(NAME buffer_test COMMAND buffer_test)
+
+add_executable(validity_bitmap_test
+  tests/wp1_test_main.cpp tests/validity_bitmap_test.cpp)
+target_link_libraries(validity_bitmap_test PRIVATE doctest qe_core)
+add_test(NAME validity_bitmap_test COMMAND validity_bitmap_test)
+
+add_executable(selection_vector_test
+  tests/wp1_test_main.cpp tests/selection_vector_test.cpp)
+target_link_libraries(selection_vector_test PRIVATE doctest qe_core)
+add_test(NAME selection_vector_test COMMAND selection_vector_test)
+
+add_executable(validity_mutation_test
+  tests/wp1_test_main.cpp tests/validity_mutation_test.cpp)
+target_link_libraries(validity_mutation_test
+  PRIVATE doctest qe_core qe_validity_mutants)
+add_test(NAME validity_mutation_test COMMAND validity_mutation_test)
