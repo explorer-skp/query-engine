@@ -24,6 +24,7 @@
 #include "bench_report.h"
 #include "bench_util.h"
 #include "load_harness.h"
+#include "tools/hwy_target.h"
 
 using namespace qe::bench;
 
@@ -68,7 +69,9 @@ int main(int argc, char** argv) {
     const std::string label = argValue(argc, argv, "--label", "co_demo");
     const std::string outPath = argValue(argc, argv, "--out", "");
 
-    const MachineState machine = captureMachineState();
+    MachineState machine = captureMachineState();
+    // Real runtime Highway target (detected, not the compile-time fallback).
+    machine.hwyTarget = qe::tools::dispatchedHighwayTarget();
     std::string host = argValue(argc, argv, "--host", "");
     if (host.empty()) host = deriveHostTag(machine.cpuModel);
     std::string isa = argValue(argc, argv, "--isa", "");

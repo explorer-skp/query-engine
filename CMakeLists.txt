@@ -20,6 +20,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Repo root is an include root so engine headers resolve by their module path
+# ("core/types.h", "ops/operator.h", "tools/hwy_target.h", ...). This matches the
+# include style the frozen DRAFT headers use among themselves.
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
 option(ENABLE_SANITIZERS "Build with AddressSanitizer + UBSan" OFF)
 option(ENABLE_TSAN "Build with ThreadSanitizer (mutually exclusive with ENABLE_SANITIZERS)" OFF)
 
@@ -29,9 +34,12 @@ endif()
 
 add_compile_options(-Wall -Wextra -Werror)
 
-# Never hardcode the ISA flag: detect what the compiler accepts (Apple clang on
-# arm64 rejects -march=native; x86 GCC/Clang accept it). Detected at configure
-# time, recorded in the provenance string below — config, not a literal.
+# Never hardcode the ISA flag: detect what the compiler accepts, then pick
+# -march=native (typical on x86 GCC/Clang) -> -mcpu=native (typical on arm) ->
+# empty. Detected at configure time, recorded in the provenance string below —
+# config, not a literal. (Note: our dev compiler, Apple clang 21 on arm64, DOES
+# accept -march=native; older Apple clang did not. The detection keeps both that
+# history and the x86 build honest from one source tree.)
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-march=native" QE_HAS_MARCH_NATIVE)
 if(QE_HAS_MARCH_NATIVE)
@@ -72,15 +80,25 @@ if(NOT QE_GIT_RES EQUAL 0 OR QE_GIT_COMMIT STREQUAL "")
   set(QE_GIT_COMMIT "uncommitted")
 endif()
 
+# QE_HWY_TARGET is a compile-time FALLBACK only. The authoritative value is
+# detected at RUNTIME via Highway dispatch (tools/hwy_target.{h,cpp}) and written
+# into the host-state/bench JSON by the emitting drivers — a compile constant
+# cannot honestly name the dispatched target (esp. when cross-compiling). The old
+# "n/a-WP-H" placeholder is gone now that Highway is vendored and wired.
 add_compile_definitions(
   QE_GIT_COMMIT="${QE_GIT_COMMIT}"
   QE_CXX_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
   QE_CXX_FLAGS="${QE_FLAGS_DESC}"
-  QE_HWY_TARGET="n/a-WP-H")
+  QE_HWY_TARGET="runtime-detected-see-hwy_target")
 
 # Vendored single-header doctest (third_party/doctest/doctest.h).
 add_library(doctest INTERFACE)
 target_include_directories(doctest INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
+# Vendored, pinned Google Highway 1.2.0 (third_party/highway/, self-contained).
+# Builds the static `hwy` target; see third_party/highway/CMakeLists.txt and
+# third_party/highway/VENDORING.md. No engine kernels use it yet (WP-1 onward).
+add_subdirectory(third_party/highway)
 
 find_package(Threads REQUIRED)
 
@@ -93,15 +111,35 @@ add_library(bench_infra STATIC
 target_include_directories(bench_infra PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/bench)
 target_link_libraries(bench_infra PUBLIC Threads::Threads)
 
+# Runtime Highway-target probe (provenance helper, NOT an engine kernel). It is
+# the only thing in WP-0 that links Highway; keeping it out of bench_infra means
+# the three WP-H self-tests stay Highway-free. -Wno-error because the TU includes
+# third-party Highway template machinery we do not patch (our glue is tiny).
+add_library(hwy_target_probe STATIC tools/hwy_target.cpp)
+target_link_libraries(hwy_target_probe PUBLIC hwy)
+target_compile_options(hwy_target_probe PRIVATE -Wno-error)
+
 # Drivers.
 add_executable(host_state bench/host_state_main.cpp)
-target_link_libraries(host_state PRIVATE bench_infra)
+target_link_libraries(host_state PRIVATE bench_infra hwy_target_probe)
 
 add_executable(bench_skeleton bench/bench_skeleton_main.cpp)
-target_link_libraries(bench_skeleton PRIVATE bench_infra)
+target_link_libraries(bench_skeleton PRIVATE bench_infra hwy_target_probe)
+
+# Highway integration smoke driver: runs ONE trivial vectorized op through
+# dynamic dispatch and prints the runtime-detected target. Proves Highway builds
+# and dispatches on this host. -Wno-error: same third-party-headers rationale.
+add_executable(hwy_smoke tools/hwy_smoke.cpp)
+target_link_libraries(hwy_smoke PRIVATE hwy)
+target_compile_options(hwy_smoke PRIVATE -Wno-error)
 
 # Self-tests (the credibility layer).
 enable_testing()
+
+# WP-0: DRAFT interface headers compile and are self-contained. Instantiates no
+# behavior — failing to compile is the whole signal. Full -Wall -Wextra -Werror.
+add_executable(headers_compile_test tests/headers_compile_test.cpp)
+add_test(NAME headers_compile_test COMMAND headers_compile_test)
 
 add_executable(histogram_test tests/test_main.cpp tests/histogram_test.cpp)
 target_link_libraries(histogram_test PRIVATE doctest bench_infra)

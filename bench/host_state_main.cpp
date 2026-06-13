@@ -18,6 +18,7 @@
 #include <string_view>
 
 #include "bench_report.h"
+#include "tools/hwy_target.h"
 
 using namespace qe::bench;
 
@@ -58,7 +59,10 @@ std::string argValue(int argc, char** argv, std::string_view flag) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const MachineState m = captureMachineState();
+    MachineState m = captureMachineState();
+    // Replace the compile-time provenance fallback with the target Highway
+    // actually dispatches to on this host (detected at runtime, never hardcoded).
+    m.hwyTarget = qe::tools::dispatchedHighwayTarget();
 
     std::string host = argValue(argc, argv, "--host");
     if (host.empty()) host = deriveHostTag(m.cpuModel);
