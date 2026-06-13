@@ -1,0 +1,12 @@
+# Authored for WP-H: the source repo shipped no .clang-format, so this codifies
+# the style the harvested files already follow — Google base, 4-space indent,
+# 80 columns, left-aligned pointers/references.
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 80
+PointerAlignment: Left
+DerivePointerAlignment: false
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+SortIncludes: true
+IncludeBlocks: Preserve

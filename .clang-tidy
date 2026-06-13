@@ -1,0 +1,14 @@
+# Authored for WP-H: the source repo shipped no .clang-tidy. A modest, low-noise
+# set focused on real defects in the harvested infra; not wired as a hard gate
+# (WP-0 may tighten). Sanitizers + -Wall -Wextra -Werror remain the build gate.
+Checks: >
+  bugprone-*,
+  performance-*,
+  portability-*,
+  modernize-use-override,
+  modernize-use-nullptr,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*/bench/.*'
+FormatStyle: file

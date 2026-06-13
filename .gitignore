@@ -1,0 +1,14 @@
+# CMake build trees (canonical: build/, build-asan/, build-tsan/ via presets)
+/build/
+/build-asan/
+/build-tsan/
+# Direct-compile scratch (used when cmake is unavailable; see WP-H report)
+/out/
+*.o
+*.obj
+# Generated bench output
+**/plots/
+**/summary.txt
+# Python
+__pycache__/
+*.pyc
