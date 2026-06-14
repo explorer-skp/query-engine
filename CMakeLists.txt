@@ -191,8 +191,18 @@ add_library(qe_ops STATIC
   ops/table.cpp
   ops/scan.cpp
   ops/filter.cpp
-  ops/project.cpp)
-target_link_libraries(qe_ops PUBLIC qe_expr)
+  ops/project.cpp
+  ops/aggregate.cpp
+  ops/agg_kernels.cpp
+  ops/agg_scalar.cpp)
+target_link_libraries(qe_ops PUBLIC qe_expr qe_hashtable)
+# Only the vector kernel TU pulls in Highway template headers, so only it opts
+# out of -Werror; the scalar twin, the operator, and the internal helpers keep
+# the full gate. qe_ops links qe_hashtable (the WP-4 substrate the GROUP BY path
+# builds on); qe_hashtable carries qe_core/qe_simd/hwy transitively.
+set_source_files_properties(
+  ops/agg_kernels.cpp
+  PROPERTIES COMPILE_OPTIONS "-Wno-error")
 
 # --- WP-3: DuckDB differential oracle (TEST/ORACLE TARGETS ONLY) -------------
 # qe_oracle is the differential harness: result-set compare (D11/D12), the
@@ -264,6 +274,13 @@ set_source_files_properties(
 # table by exactly one slot/grow step.
 add_library(qe_hashtable_mutants STATIC ops/hashtable_mutants.cpp)
 target_link_libraries(qe_hashtable_mutants PUBLIC qe_hashtable)
+
+# --- WP-5: test-only planted mutant of the aggregation operator. NOT linked into
+# any engine target — only the WP-5 mutation self-test. Reuses qe_ops' shared
+# agg_internal helpers so the mutant differs from the real operator by exactly one
+# accumulate/finalize/output step (the §5 "skip a null in SUM" family).
+add_library(qe_aggregate_mutants STATIC ops/aggregate_mutants.cpp)
+target_link_libraries(qe_aggregate_mutants PUBLIC qe_ops)
 
 # Drivers.
 add_executable(host_state bench/host_state_main.cpp)
@@ -413,3 +430,28 @@ target_link_libraries(hashtable_mutation_test
   PRIVATE doctest qe_hashtable qe_hashtable_mutants)
 add_test(NAME hashtable_mutation_test
   COMMAND hashtable_mutation_test --seed ${QE_CI_SEED})
+
+# --- WP-5 tests: hash aggregation / GROUP BY. Reuse tests/wp1_test_main.cpp. ---
+# scalar==vector for the masked-reduction kernels (direct + end-to-end global).
+add_executable(agg_scalar_vector_test
+  tests/wp1_test_main.cpp tests/agg_scalar_vector_test.cpp)
+target_link_libraries(agg_scalar_vector_test PRIVATE doctest qe_oracle)
+add_test(NAME agg_scalar_vector_test
+  COMMAND agg_scalar_vector_test --seed ${QE_CI_SEED})
+
+# The M2 proof: GROUP BY diffs green vs the oracle (reference + DuckDB when staged).
+add_executable(aggregate_differential_test
+  tests/wp1_test_main.cpp tests/aggregate_differential_test.cpp)
+target_link_libraries(aggregate_differential_test PRIVATE doctest qe_oracle)
+add_test(NAME aggregate_differential_test
+  COMMAND aggregate_differential_test --seed ${QE_CI_SEED})
+
+# Mutation self-test: the differential MUST flag a corrupted aggregation
+# (null folded as 0 in SUM / all-null group emits 0 / dropped group), and pass on
+# the real operator.
+add_executable(agg_mutation_test
+  tests/wp1_test_main.cpp tests/agg_mutation_test.cpp)
+target_link_libraries(agg_mutation_test
+  PRIVATE doctest qe_oracle qe_aggregate_mutants)
+add_test(NAME agg_mutation_test
+  COMMAND agg_mutation_test --seed ${QE_CI_SEED})

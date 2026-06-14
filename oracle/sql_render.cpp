@@ -123,8 +123,69 @@ std::string create_table_sql(const std::string& name, const Schema& schema) {
     return os.str();
 }
 
+namespace {
+
+// The aggregate function call SQL, e.g. "SUM(c2)". CountStar is "COUNT(*)".
+std::string agg_call_sql(const AggSpec& a, const Schema& schema) {
+    if (a.func == AggFunc::CountStar) return "COUNT(*)";
+    const std::string& col = schema.fields[a.input_col].first;
+    switch (a.func) {
+        case AggFunc::Count: return "COUNT(" + col + ")";
+        case AggFunc::Sum:   return "SUM(" + col + ")";
+        case AggFunc::Min:   return "MIN(" + col + ")";
+        case AggFunc::Max:   return "MAX(" + col + ")";
+        case AggFunc::Avg:   return "AVG(" + col + ")";
+        case AggFunc::CountStar: break;  // handled above
+    }
+    return "COUNT(*)";  // unreachable
+}
+
+// Render a group-by query. Each output column is wrapped in a CAST to the
+// engine's result type so the DuckDB column type matches EXACTLY. The CAST on
+// SUM is the overflow-honesty step: DuckDB's SUM(INTEGER)/SUM(BIGINT) return
+// HUGEINT; casting to BIGINT makes the read-back I64 unambiguous, and the oracle
+// generators bound the data so every per-group sum provably fits I64 (so the cast
+// never raises). See oracle/generators.* and the WP-5 report.
+std::string group_by_sql(const std::string& name, const Schema& schema,
+                         const LogicalQuery& q) {
+    const GroupBy& gb = *q.group_by;
+    std::ostringstream os;
+    os << "SELECT ";
+    bool first = true;
+    for (std::uint32_t kc : gb.keys) {
+        if (!first) os << ", ";
+        first = false;
+        const auto& f = schema.fields[kc];
+        os << "CAST((" << f.first << ") AS " << sql_type(f.second) << ") AS "
+           << f.first;
+    }
+    for (const auto& a : gb.aggs) {
+        if (!first) os << ", ";
+        first = false;
+        const Type in = (a.func == AggFunc::CountStar)
+                            ? Type::I64
+                            : schema.fields[a.input_col].second;
+        const Type rt = agg_result_type(a.func, in);
+        os << "CAST((" << agg_call_sql(a, schema) << ") AS " << sql_type(rt)
+           << ") AS " << a.out_name;
+    }
+    os << " FROM " << name;
+    if (q.has_filter()) os << " WHERE " << expr_to_sql(q.filter, schema);
+    if (!gb.keys.empty()) {
+        os << " GROUP BY ";
+        for (std::size_t i = 0; i < gb.keys.size(); ++i) {
+            if (i) os << ", ";
+            os << schema.fields[gb.keys[i]].first;
+        }
+    }
+    return os.str();
+}
+
+}  // namespace
+
 std::string select_sql(const std::string& name, const Schema& schema,
                        const LogicalQuery& q) {
+    if (q.has_group_by()) return group_by_sql(name, schema, q);
     std::ostringstream os;
     os << "SELECT ";
     for (std::size_t i = 0; i < q.projections.size(); ++i) {

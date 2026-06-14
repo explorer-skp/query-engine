@@ -118,8 +118,11 @@ ResultSet run_duckdb(const Table& table, const LogicalQuery& q) {
     if (result->HasError())
         throw DuckDBError(result->GetError() + "  [sql: " + sql + "]");
 
+    // Result column order/types are the single-source-of-truth output schema
+    // (projection columns, or GROUP BY keys-then-aggregates).
     ResultSet rs;
-    for (const auto& p : q.projections) rs.types.push_back(p.expr.type());
+    const Schema out = query_output_schema(table.schema(), q);
+    for (const auto& f : out.fields) rs.types.push_back(f.second);
 
     const std::size_t nrow = result->RowCount();
     const std::size_t ncol = rs.types.size();

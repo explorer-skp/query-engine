@@ -1,6 +1,7 @@
 //  WP-3 (seed of WP-9): seeded schema/data/query generators. See generators.h.
 #include "oracle/generators.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -233,6 +234,65 @@ LogicalQuery gen_query(std::mt19937_64& rng, const Schema& schema) {
     for (int i = 0; i < nproj; ++i)
         q.projections.push_back(
             Projection{"p" + std::to_string(i), gen_proj_expr(rng, c)});
+    return q;
+}
+
+LogicalQuery gen_group_by_query(std::mt19937_64& rng, const Schema& schema) {
+    const Cols c = classify(schema);
+    const std::uint32_t ncols = static_cast<std::uint32_t>(schema.fields.size());
+    LogicalQuery q;
+    // ~50% carry a WHERE (exercise both the filtered and unfiltered group build).
+    if (rng() % 2 == 0) q.filter = gen_pred(rng, c, 2);
+
+    GroupBy gb;
+    // Key subset: 0..min(3, ncols) DISTINCT columns. 0 keys => global aggregate.
+    std::vector<std::uint32_t> perm(ncols);
+    for (std::uint32_t i = 0; i < ncols; ++i) perm[i] = i;
+    for (std::uint32_t i = ncols; i > 1; --i)
+        std::swap(perm[i - 1], perm[rng() % i]);  // Fisher-Yates (seeded)
+    const std::uint32_t max_keys =
+        std::min<std::uint32_t>(3, ncols);
+    const std::uint32_t nk =
+        static_cast<std::uint32_t>(rng() % (max_keys + 1));
+    for (std::uint32_t i = 0; i < nk; ++i) gb.keys.push_back(perm[i]);
+
+    // Aggregate subset: 1..4. SUM/AVG only over numeric columns.
+    const int na = 1 + static_cast<int>(rng() % 4);
+    for (int i = 0; i < na; ++i) {
+        const std::string name = "a" + std::to_string(i);
+        switch (rng() % 6) {
+            case 0:
+                gb.aggs.push_back(AggSpec::count_star(name));
+                break;
+            case 1:
+                gb.aggs.push_back(AggSpec::count(
+                    static_cast<std::uint32_t>(rng() % ncols), name));
+                break;
+            case 2:
+                if (!c.num.empty())
+                    gb.aggs.push_back(
+                        AggSpec::sum(c.num[rng() % c.num.size()], name));
+                else
+                    gb.aggs.push_back(AggSpec::count_star(name));
+                break;
+            case 3:
+                if (!c.num.empty())
+                    gb.aggs.push_back(
+                        AggSpec::avg(c.num[rng() % c.num.size()], name));
+                else
+                    gb.aggs.push_back(AggSpec::count_star(name));
+                break;
+            case 4:
+                gb.aggs.push_back(AggSpec::min(
+                    static_cast<std::uint32_t>(rng() % ncols), name));
+                break;
+            default:
+                gb.aggs.push_back(AggSpec::max(
+                    static_cast<std::uint32_t>(rng() % ncols), name));
+                break;
+        }
+    }
+    q.group_by = std::move(gb);
     return q;
 }
 

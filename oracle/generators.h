@@ -56,4 +56,13 @@ Table gen_table(std::mt19937_64& rng, const Schema& schema,
 // `schema`, within the divergence-safe grammar described above.
 LogicalQuery gen_query(std::mt19937_64& rng, const Schema& schema);
 
+// Generate a GROUP BY LogicalQuery (WP-5): an optional BOOL filter, a random key
+// subset (0..3 distinct columns; 0 => a single global aggregate), and a random
+// aggregate subset (1..4 of COUNT(*)/COUNT/SUM/MIN/MAX/AVG). SUM/AVG are emitted
+// only over numeric columns, and the data magnitude bounds above keep every
+// per-group integer sum provably within the I64 accumulator (the SUM result type;
+// see ops/aggregate.h and the WP-5 report), so DuckDB's HUGEINT SUM, cast back to
+// BIGINT in the SQL, never disagrees.
+LogicalQuery gen_group_by_query(std::mt19937_64& rng, const Schema& schema);
+
 }  // namespace qe::oracle
