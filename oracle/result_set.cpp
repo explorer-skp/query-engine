@@ -106,7 +106,7 @@ ResultSet drain_operator(Operator& root) {
 }
 
 DiffResult compare_result_sets(const ResultSet& engine_in,
-                               const ResultSet& oracle_in) {
+                               const ResultSet& oracle_in, bool ordered) {
     DiffResult r;
     if (engine_in.types != oracle_in.types) {
         r.message = "column type/shape mismatch";
@@ -120,9 +120,16 @@ DiffResult compare_result_sets(const ResultSet& engine_in,
         return r;
     }
 
+    // UNORDERED (D12 default): canonicalize both sides so row order is irrelevant.
+    // ORDERED (explicit ORDER BY, WP-7): compare positionally in emitted order,
+    // NO canonicalization — that is what makes a wrong sort observable. The
+    // cell-level rules (D11 epsilon / exact int / exact null) are identical.
     ResultSet e = engine_in, o = oracle_in;
-    canonicalize(e);
-    canonicalize(o);
+    if (!ordered) {
+        canonicalize(e);
+        canonicalize(o);
+    }
+    const char* row_label = ordered ? "row" : "canonical row";
 
     for (std::size_t row = 0; row < e.num_rows(); ++row) {
         for (std::size_t c = 0; c < e.types.size(); ++c) {
@@ -130,8 +137,8 @@ DiffResult compare_result_sets(const ResultSet& engine_in,
             const Cell& oc = o.rows[row][c];
             if (ec.is_null != oc.is_null) {
                 std::ostringstream os;
-                os << "null mismatch at canonical row " << row << " col " << c
-                   << ": engine=" << cell_str(ec, e.types[c])
+                os << "null mismatch at " << row_label << " " << row << " col "
+                   << c << ": engine=" << cell_str(ec, e.types[c])
                    << " oracle=" << cell_str(oc, o.types[c]);
                 r.message = os.str();
                 return r;
@@ -144,8 +151,8 @@ DiffResult compare_result_sets(const ResultSet& engine_in,
                 same = ec.i == oc.i;
             if (!same) {
                 std::ostringstream os;
-                os << "value mismatch at canonical row " << row << " col " << c
-                   << ": engine=" << cell_str(ec, e.types[c])
+                os << "value mismatch at " << row_label << " " << row << " col "
+                   << c << ": engine=" << cell_str(ec, e.types[c])
                    << " oracle=" << cell_str(oc, o.types[c]);
                 r.message = os.str();
                 return r;

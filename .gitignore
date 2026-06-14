@@ -1,7 +1,9 @@
-# CMake build trees (canonical: build/, build-asan/, build-tsan/ via presets)
+# CMake build trees (canonical: build/, build-asan/, build-tsan/ via presets;
+# build-* covers ad-hoc audit/scratch trees, e.g. build-audit/)
 /build/
 /build-asan/
 /build-tsan/
+/build-*/
 # Direct-compile scratch (used when cmake is unavailable; see WP-H report)
 /out/
 *.o

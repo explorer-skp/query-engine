@@ -36,4 +36,18 @@ std::string create_table_sql(const std::string& name, const Schema& schema);
 std::string select_sql(const std::string& name, const Schema& schema,
                        const LogicalQuery& q);
 
+// WP-6: render a join to SQL the DuckDB oracle runs:
+//   "SELECT CAST(p.<c> AS T) AS o0, ... , CAST(b.<c> AS T) AS oK, ...
+//      FROM <probe_name> AS p [LEFT] JOIN <build_name> AS b
+//        ON p.<pk0> = b.<bk0> [AND ...]"
+// Probe columns first, then build columns, aliased o0..oN by POSITION (so the
+// identical c0/c1 names on the two sides never collide). Each output column is
+// wrapped CAST(.. AS <its type>) so the DuckDB result column type matches the
+// engine's exactly (the WP-5 CAST precedent). NULL keys never match because SQL
+// `=` is NULL on a NULL operand and JOIN ON treats that as non-match — exactly
+// NullPolicy::kNeverMatch.
+std::string join_sql(const Schema& probe, const Schema& build,
+                     const JoinQuery& jq, const std::string& probe_name,
+                     const std::string& build_name);
+
 }  // namespace qe::oracle

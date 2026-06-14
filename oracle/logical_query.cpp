@@ -7,6 +7,7 @@
 
 #include "ops/aggregate.h"
 #include "ops/filter.h"
+#include "ops/join.h"
 #include "ops/scan.h"
 
 namespace qe::oracle {
@@ -46,7 +47,31 @@ std::unique_ptr<Operator> build_engine_pipeline(const Table& table,
     } else {
         node = std::make_unique<Project>(std::move(node), q.projections);
     }
+    // WP-7: ORDER BY is a top-level modifier applied AFTER project/aggregate; its
+    // keys reference the query's OUTPUT columns, which are exactly this node's
+    // output columns.
+    if (q.has_order_by())
+        node = std::make_unique<Sort>(std::move(node), *q.order_by);
     return node;
+}
+
+Schema join_output_schema(const Schema& probe, const Schema& build) {
+    Schema s;
+    s.fields.reserve(probe.fields.size() + build.fields.size());
+    for (const auto& f : probe.fields) s.fields.push_back(f);
+    for (const auto& f : build.fields) s.fields.push_back(f);
+    return s;
+}
+
+std::unique_ptr<Operator> build_join_pipeline(const Table& probe,
+                                              const Table& build,
+                                              const JoinQuery& jq,
+                                              std::size_t batch_size) {
+    auto probe_scan = std::make_unique<Scan>(probe, batch_size);
+    auto build_scan = std::make_unique<Scan>(build, batch_size);
+    return std::make_unique<HashJoin>(std::move(probe_scan),
+                                      std::move(build_scan), jq.probe_keys,
+                                      jq.build_keys, jq.type);
 }
 
 }  // namespace qe::oracle

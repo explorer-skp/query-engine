@@ -181,11 +181,64 @@ std::string group_by_sql(const std::string& name, const Schema& schema,
     return os.str();
 }
 
+// WP-7: render an explicit ORDER BY over the query's OUTPUT columns. Keys are
+// rendered by 1-based ORDINAL (output position) so they bind unambiguously to the
+// SELECT list regardless of column names — the output position matches
+// query_output_schema order, which is the engine's output order. NULLS FIRST/LAST
+// is emitted explicitly so the result never depends on DuckDB's default null
+// order. Empty when the query has no ORDER BY.
+std::string order_by_clause(const LogicalQuery& q) {
+    if (!q.has_order_by()) return "";
+    std::ostringstream os;
+    os << " ORDER BY ";
+    const auto& keys = *q.order_by;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (i) os << ", ";
+        os << (keys[i].col + 1)
+           << (keys[i].dir == SortDir::Desc ? " DESC" : " ASC")
+           << (keys[i].nulls == NullOrder::First ? " NULLS FIRST"
+                                                 : " NULLS LAST");
+    }
+    return os.str();
+}
+
 }  // namespace
+
+std::string join_sql(const Schema& probe, const Schema& build,
+                     const JoinQuery& jq, const std::string& probe_name,
+                     const std::string& build_name) {
+    std::ostringstream os;
+    os << "SELECT ";
+    std::size_t o = 0;
+    // Probe columns, aliased o0..  by position; CAST to the engine's own type.
+    for (const auto& f : probe.fields) {
+        if (o) os << ", ";
+        os << "CAST(p." << f.first << " AS " << sql_type(f.second) << ") AS o"
+           << o;
+        ++o;
+    }
+    // Build columns next.
+    for (const auto& f : build.fields) {
+        if (o) os << ", ";
+        os << "CAST(b." << f.first << " AS " << sql_type(f.second) << ") AS o"
+           << o;
+        ++o;
+    }
+    os << " FROM " << probe_name << " AS p "
+       << (jq.type == JoinType::Left ? "LEFT JOIN " : "JOIN ") << build_name
+       << " AS b ON ";
+    for (std::size_t i = 0; i < jq.probe_keys.size(); ++i) {
+        if (i) os << " AND ";
+        os << "p." << probe.fields[jq.probe_keys[i]].first << " = b."
+           << build.fields[jq.build_keys[i]].first;
+    }
+    return os.str();
+}
 
 std::string select_sql(const std::string& name, const Schema& schema,
                        const LogicalQuery& q) {
-    if (q.has_group_by()) return group_by_sql(name, schema, q);
+    if (q.has_group_by())
+        return group_by_sql(name, schema, q) + order_by_clause(q);
     std::ostringstream os;
     os << "SELECT ";
     for (std::size_t i = 0; i < q.projections.size(); ++i) {
@@ -198,6 +251,7 @@ std::string select_sql(const std::string& name, const Schema& schema,
     }
     os << " FROM " << name;
     if (q.has_filter()) os << " WHERE " << expr_to_sql(q.filter, schema);
+    os << order_by_clause(q);  // WP-7: explicit ORDER BY when present
     return os.str();
 }
 

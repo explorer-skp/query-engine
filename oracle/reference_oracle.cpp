@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -343,10 +344,45 @@ ResultSet run_reference_group_by(const Table& table, const LogicalQuery& q) {
     return rs;
 }
 
+// WP-7: independently sort a ResultSet's rows by an ORDER BY key list, for the
+// POSITIONAL differential. Shares NO code with the engine's radix/comparison sort
+// (it compares already-materialized Cells), so "engine == reference" under ORDERED
+// compare is a meaningful check of the sort. std::stable_sort matches the engine's
+// stability on the child's (table/first-seen) row order; NULL placement is
+// ABSOLUTE (independent of ASC/DESC), and F64 uses IEEE order — the same contract
+// the engine's comparator and DuckDB obey.
+void apply_order_by(ResultSet& rs, const std::vector<SortKey>& keys) {
+    std::stable_sort(
+        rs.rows.begin(), rs.rows.end(),
+        [&](const std::vector<Cell>& a, const std::vector<Cell>& b) {
+            for (const SortKey& k : keys) {
+                const Cell& ca = a[k.col];
+                const Cell& cb = b[k.col];
+                if (ca.is_null || cb.is_null) {
+                    if (ca.is_null && cb.is_null) continue;
+                    const bool a_null = ca.is_null;
+                    return (k.nulls == NullOrder::First) ? a_null : !a_null;
+                }
+                int cmp;
+                if (rs.types[k.col] == Type::F64)
+                    cmp = (ca.f < cb.f) ? -1 : (ca.f > cb.f) ? 1 : 0;
+                else
+                    cmp = (ca.i < cb.i) ? -1 : (ca.i > cb.i) ? 1 : 0;
+                if (cmp != 0)
+                    return (k.dir == SortDir::Asc) ? (cmp < 0) : (cmp > 0);
+            }
+            return false;  // fully equal: stable_sort keeps original order
+        });
+}
+
 }  // namespace
 
 ResultSet run_reference(const Table& table, const LogicalQuery& q) {
-    if (q.has_group_by()) return run_reference_group_by(table, q);
+    if (q.has_group_by()) {
+        ResultSet rs = run_reference_group_by(table, q);
+        if (q.has_order_by()) apply_order_by(rs, *q.order_by);
+        return rs;
+    }
 
     const Batch full = table.full_batch_view();
     const std::size_t n = table.num_rows();
@@ -389,6 +425,112 @@ ResultSet run_reference(const Table& table, const LogicalQuery& q) {
         row.reserve(proj.size());
         for (const auto& pc : proj) row.push_back(read_dense(pc, r));
         rs.rows.push_back(std::move(row));
+    }
+    if (q.has_order_by()) apply_order_by(rs, *q.order_by);  // WP-7
+    return rs;
+}
+
+namespace {
+
+// Read one cell from a (dense, whole-table) Column view at physical row r.
+Cell read_cell_col(const Column& c, std::size_t r) {
+    Cell cell;
+    const bool valid = c.all_valid || validity::get_bit(c.validity, r);
+    if (!valid) {
+        cell.is_null = true;
+        return cell;
+    }
+    switch (c.type) {
+        case Type::I32:
+            cell.i = reinterpret_cast<const std::int32_t*>(c.data)[r];
+            break;
+        case Type::I64:
+        case Type::TS:
+            cell.i = reinterpret_cast<const std::int64_t*>(c.data)[r];
+            break;
+        case Type::BOOL:
+            cell.i = reinterpret_cast<const std::uint8_t*>(c.data)[r];
+            break;
+        case Type::F64:
+            cell.f = reinterpret_cast<const double*>(c.data)[r];
+            break;
+    }
+    return cell;
+}
+
+}  // namespace
+
+ResultSet run_join_reference(const Table& probe, const Table& build,
+                             const JoinQuery& jq) {
+    const Schema out = join_output_schema(probe.schema(), build.schema());
+    ResultSet rs;
+    for (const auto& f : out.fields) rs.types.push_back(f.second);
+
+    const Batch pb = probe.full_batch_view();
+    const Batch bb = build.full_batch_view();
+    const std::size_t np = probe.num_rows();
+    const std::size_t nb = build.num_rows();
+    const std::size_t nk = jq.build_keys.size();
+
+    // Canonical key tuple of a row, or std::nullopt if ANY key column is NULL
+    // (kNeverMatch: a NULL key never matches, not even another NULL).
+    using KeyTuple = std::vector<std::uint64_t>;
+    auto key_of = [&](const Batch& b, const std::vector<std::uint32_t>& keys,
+                      const Schema& sch, std::size_t r)
+        -> std::optional<KeyTuple> {
+        KeyTuple kt;
+        kt.reserve(nk);
+        for (std::size_t j = 0; j < nk; ++j) {
+            const std::uint32_t kc = keys[j];
+            const auto [is_null, w] =
+                key_word(b.cols[kc], r, sch.fields[kc].second);
+            if (is_null) return std::nullopt;  // dead key, never matches
+            kt.push_back(w);
+        }
+        return kt;
+    };
+
+    // Build index: canonical build-key tuple -> list of build row indices. Only
+    // non-null-key build rows are inserted (null keys never match).
+    std::map<KeyTuple, std::vector<std::size_t>> index;
+    for (std::size_t r = 0; r < nb; ++r) {
+        auto kt = key_of(bb, jq.build_keys, build.schema(), r);
+        if (kt) index[*kt].push_back(r);
+    }
+
+    auto emit_build_null = [&](std::vector<Cell>& row) {
+        for (std::size_t c = 0; c < build.schema().fields.size(); ++c) {
+            Cell cell;
+            cell.is_null = true;
+            row.push_back(cell);
+        }
+    };
+
+    for (std::size_t r = 0; r < np; ++r) {
+        std::vector<Cell> probe_cells;
+        probe_cells.reserve(probe.schema().fields.size());
+        for (std::size_t c = 0; c < probe.schema().fields.size(); ++c)
+            probe_cells.push_back(read_cell_col(pb.cols[c], r));
+
+        auto kt = key_of(pb, jq.probe_keys, probe.schema(), r);
+        const std::vector<std::size_t>* matches = nullptr;
+        if (kt) {
+            auto it = index.find(*kt);
+            if (it != index.end()) matches = &it->second;
+        }
+
+        if (matches) {
+            for (std::size_t br : *matches) {
+                std::vector<Cell> row = probe_cells;
+                for (std::size_t c = 0; c < build.schema().fields.size(); ++c)
+                    row.push_back(read_cell_col(bb.cols[c], br));
+                rs.rows.push_back(std::move(row));
+            }
+        } else if (jq.type == JoinType::Left) {
+            std::vector<Cell> row = probe_cells;
+            emit_build_null(row);
+            rs.rows.push_back(std::move(row));
+        }
     }
     return rs;
 }

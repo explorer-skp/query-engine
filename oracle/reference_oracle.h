@@ -22,4 +22,15 @@ namespace qe::oracle {
 
 ResultSet run_reference(const Table& table, const LogicalQuery& q);
 
+// WP-6: the INDEPENDENT reference for a two-input equi-join. Computes the join
+// DIRECTLY with a std::map keyed by the canonical build-key tuple plus a nested
+// scan — it shares NO code path with the engine's HashJoin / HashTable / gather,
+// so "engine == reference" is a meaningful differential (alongside the
+// authoritative DuckDB diff). Reproduces the documented key semantics
+// independently: a key tuple with ANY NULL never matches (kNeverMatch), F64 zero
+// canonicalizes to +0.0 and NaN to a canonical quiet NaN so equality matches the
+// engine's; output column order is probe columns then build columns.
+ResultSet run_join_reference(const Table& probe, const Table& build,
+                             const JoinQuery& jq);
+
 }  // namespace qe::oracle

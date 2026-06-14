@@ -194,7 +194,10 @@ add_library(qe_ops STATIC
   ops/project.cpp
   ops/aggregate.cpp
   ops/agg_kernels.cpp
-  ops/agg_scalar.cpp)
+  ops/agg_scalar.cpp
+  ops/join.cpp
+  ops/sort.cpp
+  ops/sort_internal.cpp)
 target_link_libraries(qe_ops PUBLIC qe_expr qe_hashtable)
 # Only the vector kernel TU pulls in Highway template headers, so only it opts
 # out of -Werror; the scalar twin, the operator, and the internal helpers keep
@@ -281,6 +284,21 @@ target_link_libraries(qe_hashtable_mutants PUBLIC qe_hashtable)
 # accumulate/finalize/output step (the §5 "skip a null in SUM" family).
 add_library(qe_aggregate_mutants STATIC ops/aggregate_mutants.cpp)
 target_link_libraries(qe_aggregate_mutants PUBLIC qe_ops)
+
+# --- WP-6: test-only planted mutant of the hash-join operator. NOT linked into
+# any engine target — only the WP-6 mutation self-test. Reuses qe_ops' shared
+# join_internal helpers (BuildStore + gather emitters) so the mutant differs from
+# the real operator by exactly one build / pair-gen / output step.
+add_library(qe_join_mutants STATIC ops/join_mutants.cpp)
+target_link_libraries(qe_join_mutants PUBLIC qe_ops)
+
+# --- WP-7: test-only planted mutant of the sort operator. NOT linked into any
+# engine target — only the WP-7 mutation self-test. Reuses qe_ops' shared
+# sort_internal helpers (materialize + gather_rows) so the mutant differs from the
+# real operator by exactly one permutation / emit step (DESC-as-ASC, flipped
+# null order, radix sign-bit, reversed tie, dropped tail).
+add_library(qe_sort_mutants STATIC ops/sort_mutants.cpp)
+target_link_libraries(qe_sort_mutants PUBLIC qe_ops)
 
 # Drivers.
 add_executable(host_state bench/host_state_main.cpp)
@@ -455,3 +473,66 @@ target_link_libraries(agg_mutation_test
   PRIVATE doctest qe_oracle qe_aggregate_mutants)
 add_test(NAME agg_mutation_test
   COMMAND agg_mutation_test --seed ${QE_CI_SEED})
+
+# --- WP-6 tests: hash equi-join. Reuse tests/wp1_test_main.cpp (prints seed). ---
+# scalar==vector for the build-row gather kernels (direct) AND end-to-end across
+# HashPath x GatherPath.
+add_executable(join_scalar_vector_test
+  tests/wp1_test_main.cpp tests/join_scalar_vector_test.cpp)
+target_link_libraries(join_scalar_vector_test PRIVATE doctest qe_oracle)
+add_test(NAME join_scalar_vector_test
+  COMMAND join_scalar_vector_test --seed ${QE_CI_SEED})
+
+# The M3 proof: INNER + LEFT join diffs green vs the oracle (reference + DuckDB
+# when staged) on seeded random two-table queries + edge cases.
+add_executable(join_differential_test
+  tests/wp1_test_main.cpp tests/join_differential_test.cpp)
+target_link_libraries(join_differential_test PRIVATE doctest qe_oracle)
+add_test(NAME join_differential_test
+  COMMAND join_differential_test --seed ${QE_CI_SEED})
+
+# Mutation self-test: the differential MUST flag a corrupted join (dropped match /
+# wrong LEFT NULL / composite first-key-only / short final batch), and pass on the
+# real operator.
+add_executable(join_mutation_test
+  tests/wp1_test_main.cpp tests/join_mutation_test.cpp)
+target_link_libraries(join_mutation_test
+  PRIVATE doctest qe_oracle qe_join_mutants)
+add_test(NAME join_mutation_test
+  COMMAND join_mutation_test --seed ${QE_CI_SEED})
+
+# --- WP-7 tests: sort / ORDER BY. Reuse tests/wp1_test_main.cpp (prints seed). ---
+# Two cross-checks that prove something: (1) radix-result == comparison-result on
+# the SAME integer inputs (two independent sort algorithms agree), and (2) the
+# permutation GATHER is scalar==vector (direct kernel + end-to-end). This is the
+# WP that carries the first vec-vs-scalar ratio (see bench_sort).
+add_executable(sort_scalar_vector_test
+  tests/wp1_test_main.cpp tests/sort_scalar_vector_test.cpp)
+target_link_libraries(sort_scalar_vector_test PRIVATE doctest qe_oracle)
+add_test(NAME sort_scalar_vector_test
+  COMMAND sort_scalar_vector_test --seed ${QE_CI_SEED})
+
+# ORDER BY diffs green vs the oracle (reference + DuckDB when staged) under
+# POSITIONAL compare (D12): single/multi key, ASC/DESC mixes, NULLS FIRST/LAST,
+# all types, ties, empty input, >2048 rows (multi-batch emit).
+add_executable(sort_differential_test
+  tests/wp1_test_main.cpp tests/sort_differential_test.cpp)
+target_link_libraries(sort_differential_test PRIVATE doctest qe_oracle)
+add_test(NAME sort_differential_test
+  COMMAND sort_differential_test --seed ${QE_CI_SEED})
+
+# Mutation self-test: under POSITIONAL compare the differential MUST flag a
+# corrupted sort (DESC-as-ASC / flipped null order / radix sign-bit / reversed
+# tie / dropped tail), and pass on the real operator.
+add_executable(sort_mutation_test
+  tests/wp1_test_main.cpp tests/sort_mutation_test.cpp)
+target_link_libraries(sort_mutation_test
+  PRIVATE doctest qe_oracle qe_sort_mutants)
+add_test(NAME sort_mutation_test
+  COMMAND sort_mutation_test --seed ${QE_CI_SEED})
+
+# WP-7 benchmark: the permutation-gather vec-vs-scalar relative ratio (p50/p99),
+# emitted as JSON tagged host+isa. Mac numbers are preliminary / relative-only
+# (RIGOR.md §2). Built from the Release config; see the WP report for the command.
+add_executable(bench_sort bench/bench_sort_main.cpp)
+target_link_libraries(bench_sort PRIVATE qe_ops bench_infra hwy_target_probe)

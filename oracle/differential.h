@@ -34,4 +34,22 @@ DiffResult run_differential(const Table& table, const LogicalQuery& q,
 DiffResult run_vs_reference(const Table& table, const LogicalQuery& q,
                             std::size_t batch_size = Scan::kDefaultBatchSize);
 
+// ---- WP-6: two-input join differential -------------------------------------
+// A join oracle is `(probe, build, JoinQuery) -> ResultSet`, so the identical
+// runner + comparator serve both backends (independent reference / DuckDB).
+using JoinOracleFn =
+    std::function<ResultSet(const Table&, const Table&, const JoinQuery&)>;
+
+// Run engine-join-vs-oracle and return the verdict. batch_size is forwarded to
+// both Scans (varying it exercises build-across-batches and the output-batch
+// fan-out tail).
+DiffResult run_join_differential(const Table& probe, const Table& build,
+                                 const JoinQuery& jq, const JoinOracleFn& oracle,
+                                 std::size_t batch_size = Scan::kDefaultBatchSize);
+
+// Convenience: engine join vs the independent reference oracle.
+DiffResult run_join_vs_reference(
+    const Table& probe, const Table& build, const JoinQuery& jq,
+    std::size_t batch_size = Scan::kDefaultBatchSize);
+
 }  // namespace qe::oracle

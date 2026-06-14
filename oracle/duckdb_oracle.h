@@ -40,4 +40,11 @@ struct DuckDBError : std::runtime_error {
 // when duckdb_available(); throws std::logic_error otherwise.
 ResultSet run_duckdb(const Table& table, const LogicalQuery& q);
 
+// WP-6: run a two-input equi-join through DuckDB. Loads `probe` and `build` as
+// SQL tables, renders the join (oracle/sql_render.h join_sql), runs it, and reads
+// the result back into a ResultSet feeding the IDENTICAL comparator. Authoritative
+// golden model (D16). Only available when duckdb_available().
+ResultSet run_join_duckdb(const Table& probe, const Table& build,
+                          const JoinQuery& jq);
+
 }  // namespace qe::oracle

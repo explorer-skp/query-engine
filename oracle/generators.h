@@ -29,6 +29,25 @@
 
 namespace qe::oracle {
 
+// WP-6: a generated two-input join case — two correlated Tables (probe/build) and
+// the JoinQuery to run over them. The two tables share the key column types (keys
+// are columns 0..nk-1 on BOTH sides); the build side draws keys from a small
+// shared DOMAIN (so distinct keys fan out and skew), and the probe side draws
+// in-domain (match) or out-of-domain (no-match) keys at a varied rate, with a
+// varied fraction of NULL keys on each side (kNeverMatch). The seed is printed by
+// the harness for replay.
+struct JoinCase {
+    Table probe;
+    Table build;
+    JoinQuery query;
+};
+
+// Generate one random join case. Varies: #keys (1..2), key types, key cardinality
+// & skew (hot key), probe match rate, NULL-key fraction, row counts, payload
+// columns, and INNER vs LEFT.
+JoinCase gen_join_case(std::mt19937_64& rng);
+
+
 // Magnitude bounds that keep all generated integer arithmetic overflow-free.
 inline constexpr std::int32_t kI32Abs = 30000;
 inline constexpr std::int64_t kI64Abs = 1'000'000'000LL;
@@ -64,5 +83,17 @@ LogicalQuery gen_query(std::mt19937_64& rng, const Schema& schema);
 // see ops/aggregate.h and the WP-5 report), so DuckDB's HUGEINT SUM, cast back to
 // BIGINT in the SQL, never disagrees.
 LogicalQuery gen_group_by_query(std::mt19937_64& rng, const Schema& schema);
+
+// Generate an ORDER BY LogicalQuery (WP-7): an optional BOOL filter, a projection
+// of EVERY column as-is (so the output schema spans all types), and an ORDER BY
+// over a random permutation of those output columns. The first 1..ncols keys are
+// "interesting" (random ASC/DESC + NULLS FIRST/LAST); the REMAINING columns are
+// appended as deterministic tiebreakers (ASC NULLS LAST). Appending the rest makes
+// the sort a TOTAL order, so the POSITIONAL differential (D12) is unambiguous:
+// remaining ties are only between rows equal in every column (element-wise equal),
+// whose relative order is therefore unobservable. The existing data generators
+// emit finite, non-NaN, non-(-0.0) floats (see above), so F64 ordering is fully
+// determined and matches DuckDB. See the WP-7 report on float/NaN determinism.
+LogicalQuery gen_order_by_query(std::mt19937_64& rng, const Schema& schema);
 
 }  // namespace qe::oracle

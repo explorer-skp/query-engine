@@ -4,10 +4,12 @@
 //  reference, or DuckDB) produce a ResultSet; compare_result_sets() applies the
 //  frozen comparison contract:
 //
-//   * D12 canonicalization: with no explicit ORDER BY (all WP-3 queries), the
-//     row order is undefined, so BOTH result sets are sorted on all output
-//     columns before diffing. (A future ORDER BY query would compare
-//     positionally; not exercised in WP-3.)
+//   * D12 canonicalization: with no explicit ORDER BY the row order is undefined,
+//     so BOTH result sets are sorted on all output columns before diffing
+//     (UNORDERED mode, the default — what every non-sort test relies on). With an
+//     explicit ORDER BY (WP-7) the query DEFINES the row order, so the comparator
+//     runs in ORDERED mode: NO canonicalization, rows compared positionally in
+//     emitted order. Select it with the `ordered` flag on compare_result_sets().
 //   * D11 float tolerance: integer-family columns (I32/I64/BOOL/TS) compare by
 //     EXACT equality; F64 columns compare with relative+absolute epsilon
 //     (summation order etc. make bit-exact float impossible in general). The
@@ -58,7 +60,15 @@ struct DiffResult {
     bool equal = false;
     std::string message;
 };
-DiffResult compare_result_sets(const ResultSet& engine, const ResultSet& oracle);
+
+// `ordered == false` (default): UNORDERED — canonicalize both sides (sort on all
+// output columns) before diffing; the historical WP-3..WP-5 behavior. `ordered ==
+// true`: ORDERED — the query carries an explicit ORDER BY (WP-7), so rows are
+// compared POSITIONALLY in emitted order with NO canonicalization. Cell-level
+// rules (D11 float epsilon, exact integers, exact nullness) are identical in both
+// modes.
+DiffResult compare_result_sets(const ResultSet& engine, const ResultSet& oracle,
+                               bool ordered = false);
 
 // Render a result set (canonicalized) to a compact string — for failure
 // diagnostics. Caps the number of rows printed.

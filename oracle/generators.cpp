@@ -164,6 +164,39 @@ Type rand_numeric_type(std::mt19937_64& rng) {
     }
 }
 
+// WP-6: a key type for a join key column. BOOL is excluded (its 2-value domain
+// makes for degenerate cardinality); F64 keys carry integer-valued doubles so
+// equality is exact across the engine / reference / DuckDB.
+Type rand_key_type(std::mt19937_64& rng) {
+    switch (rng() % 4) {
+        case 0: return Type::I32;
+        case 1: return Type::I64;
+        case 2: return Type::F64;
+        default: return Type::TS;
+    }
+}
+
+// Write integer-valued key `v` into key column `c` (type `t`) at row `i`.
+void put_key(OwnedColumn& c, Type t, std::size_t i, std::int64_t v) {
+    std::byte* d = c.mutable_data();
+    switch (t) {
+        case Type::I32:
+            reinterpret_cast<std::int32_t*>(d)[i] = static_cast<std::int32_t>(v);
+            break;
+        case Type::I64:
+        case Type::TS:
+            reinterpret_cast<std::int64_t*>(d)[i] = v;
+            break;
+        case Type::F64:
+            reinterpret_cast<double*>(d)[i] = static_cast<double>(v);
+            break;
+        case Type::BOOL:
+            reinterpret_cast<std::uint8_t*>(d)[i] =
+                static_cast<std::uint8_t>(v & 1);
+            break;
+    }
+}
+
 OwnedColumn gen_column(std::mt19937_64& rng, Type t, std::size_t n,
                        int null_pct) {
     OwnedColumn c = OwnedColumn::make(t, n);
@@ -293,6 +326,140 @@ LogicalQuery gen_group_by_query(std::mt19937_64& rng, const Schema& schema) {
         }
     }
     q.group_by = std::move(gb);
+    return q;
+}
+
+JoinCase gen_join_case(std::mt19937_64& rng) {
+    const int nk = 1 + static_cast<int>(rng() % 2);  // 1 or 2 keys
+    std::vector<Type> kt(nk);
+    for (int j = 0; j < nk; ++j) kt[j] = rand_key_type(rng);
+
+    const int D = 1 + static_cast<int>(rng() % 12);  // key cardinality 1..12
+    // Shared build-key DOMAIN, values in [0,99] (probe out-of-domain uses
+    // [1000,2000], disjoint, so a non-matching probe key provably misses).
+    std::vector<std::vector<std::int64_t>> dom(
+        nk, std::vector<std::int64_t>(D));
+    for (int j = 0; j < nk; ++j)
+        for (int t = 0; t < D; ++t) dom[j][t] = rand_in(rng, 0, 99);
+
+    const bool hot = (rng() % 2) == 0;                      // skew toward idx 0
+    const int match_pct = static_cast<int>(rng() % 101);    // probe match rate
+    const int keynull_pct = static_cast<int>(rng() % 30);   // NULL-key fraction
+    const std::size_t B = static_cast<std::size_t>(rng() % 401);  // build rows
+    const std::size_t P = static_cast<std::size_t>(rng() % 401);  // probe rows
+    const int npb = static_cast<int>(rng() % 3);  // 0..2 build payload cols
+    const int npp = static_cast<int>(rng() % 3);  // 0..2 probe payload cols
+
+    Schema bs, ps;
+    for (int j = 0; j < nk; ++j)
+        bs.fields.emplace_back("c" + std::to_string(j), kt[j]);
+    for (int j = 0; j < nk; ++j)
+        ps.fields.emplace_back("c" + std::to_string(j), kt[j]);
+    std::vector<Type> bp(npb), pp(npp);
+    for (int j = 0; j < npb; ++j) {
+        bp[j] = rand_type(rng);
+        bs.fields.emplace_back("c" + std::to_string(nk + j), bp[j]);
+    }
+    for (int j = 0; j < npp; ++j) {
+        pp[j] = rand_type(rng);
+        ps.fields.emplace_back("c" + std::to_string(nk + j), pp[j]);
+    }
+
+    auto pick_index = [&]() -> int {
+        if (hot && (rng() % 2) == 0) return 0;  // hot key (skew)
+        return static_cast<int>(rng() % static_cast<unsigned>(D));
+    };
+
+    // BUILD side: keys drawn from the domain; a keynull_pct fraction nulls ONE
+    // random key column (kNeverMatch => that row joins nothing).
+    std::vector<OwnedColumn> bkeys(nk);
+    for (int j = 0; j < nk; ++j) bkeys[j] = OwnedColumn::make(kt[j], B);
+    for (std::size_t i = 0; i < B; ++i) {
+        const bool null_key =
+            keynull_pct > 0 && static_cast<int>(rng() % 100) < keynull_pct;
+        const int null_col = null_key ? static_cast<int>(rng() % nk) : -1;
+        const int t = pick_index();
+        for (int j = 0; j < nk; ++j) {
+            put_key(bkeys[j], kt[j], i, dom[j][t]);
+            if (j == null_col) bkeys[j].set_null(i);
+        }
+    }
+    std::vector<OwnedColumn> bcols;
+    for (int j = 0; j < nk; ++j) bcols.push_back(std::move(bkeys[j]));
+    for (int j = 0; j < npb; ++j) bcols.push_back(gen_column(rng, bp[j], B, 15));
+    Table build(bs, std::move(bcols));
+
+    // PROBE side: match_pct of rows draw an in-domain key (potential match), the
+    // rest draw an out-of-domain key (guaranteed miss); keynull_pct nulls a key.
+    std::vector<OwnedColumn> pkeys(nk);
+    for (int j = 0; j < nk; ++j) pkeys[j] = OwnedColumn::make(kt[j], P);
+    for (std::size_t i = 0; i < P; ++i) {
+        const bool null_key =
+            keynull_pct > 0 && static_cast<int>(rng() % 100) < keynull_pct;
+        const bool in_domain = static_cast<int>(rng() % 100) < match_pct;
+        const int null_col = null_key ? static_cast<int>(rng() % nk) : -1;
+        const int t = pick_index();
+        for (int j = 0; j < nk; ++j) {
+            const std::int64_t v =
+                in_domain ? dom[j][t] : rand_in(rng, 1000, 2000);
+            put_key(pkeys[j], kt[j], i, v);
+            if (j == null_col) pkeys[j].set_null(i);
+        }
+    }
+    std::vector<OwnedColumn> pcols;
+    for (int j = 0; j < nk; ++j) pcols.push_back(std::move(pkeys[j]));
+    for (int j = 0; j < npp; ++j) pcols.push_back(gen_column(rng, pp[j], P, 15));
+    Table probe(ps, std::move(pcols));
+
+    JoinQuery q;
+    for (int j = 0; j < nk; ++j) {
+        q.probe_keys.push_back(static_cast<std::uint32_t>(j));
+        q.build_keys.push_back(static_cast<std::uint32_t>(j));
+    }
+    q.type = (rng() % 2) == 0 ? JoinType::Inner : JoinType::Left;
+
+    return JoinCase{std::move(probe), std::move(build), std::move(q)};
+}
+
+LogicalQuery gen_order_by_query(std::mt19937_64& rng, const Schema& schema) {
+    const Cols c = classify(schema);
+    const std::uint32_t ncols = static_cast<std::uint32_t>(schema.fields.size());
+    LogicalQuery q;
+    // ~50% carry a WHERE (exercise the filtered and unfiltered sort input).
+    if (rng() % 2 == 0) q.filter = gen_pred(rng, c, 2);
+
+    // Project EVERY column as-is: output schema == input schema, so the ORDER BY
+    // keys (output indices) cover all column types.
+    for (std::uint32_t i = 0; i < ncols; ++i)
+        q.projections.push_back(
+            Projection{"p" + std::to_string(i), col(c.type[i], i)});
+
+    // Random permutation of the columns (seeded Fisher-Yates).
+    std::vector<std::uint32_t> perm(ncols);
+    for (std::uint32_t i = 0; i < ncols; ++i) perm[i] = i;
+    for (std::uint32_t i = ncols; i > 1; --i)
+        std::swap(perm[i - 1], perm[rng() % i]);
+
+    // The first 1..ncols keys are "interesting" (random dir + null order); the
+    // rest are deterministic tiebreakers (ASC NULLS LAST) so the order is TOTAL
+    // and the positional differential is unambiguous (see generators.h / report).
+    const std::uint32_t nprimary =
+        ncols == 0 ? 0 : 1 + static_cast<std::uint32_t>(rng() % ncols);
+    std::vector<SortKey> keys;
+    keys.reserve(ncols);
+    for (std::uint32_t i = 0; i < ncols; ++i) {
+        SortKey k;
+        k.col = perm[i];
+        if (i < nprimary) {
+            k.dir = (rng() & 1u) ? SortDir::Desc : SortDir::Asc;
+            k.nulls = (rng() & 1u) ? NullOrder::First : NullOrder::Last;
+        } else {
+            k.dir = SortDir::Asc;
+            k.nulls = NullOrder::Last;
+        }
+        keys.push_back(k);
+    }
+    q.order_by = std::move(keys);
     return q;
 }
 

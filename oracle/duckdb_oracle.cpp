@@ -56,8 +56,9 @@ void must(duckdb::Connection& con, const std::string& sql) {
     if (r->HasError()) throw DuckDBError(r->GetError() + "  [sql: " + sql + "]");
 }
 
-void load_table(duckdb::Connection& con, const Table& table) {
-    must(con, create_table_sql(kTable, table.schema()));
+void load_named_table(duckdb::Connection& con, const std::string& name,
+                      const Table& table) {
+    must(con, create_table_sql(name, table.schema()));
     const std::size_t n = table.num_rows();
     const std::size_t ncol = table.num_columns();
     if (n == 0) return;
@@ -67,7 +68,7 @@ void load_table(duckdb::Connection& con, const Table& table) {
     for (std::size_t base = 0; base < n; base += kChunk) {
         const std::size_t end = std::min(base + kChunk, n);
         std::ostringstream os;
-        os << "INSERT INTO " << kTable << " VALUES ";
+        os << "INSERT INTO " << name << " VALUES ";
         for (std::size_t r = base; r < end; ++r) {
             if (r != base) os << ", ";
             os << "(";
@@ -79,6 +80,10 @@ void load_table(duckdb::Connection& con, const Table& table) {
         }
         must(con, os.str());
     }
+}
+
+void load_table(duckdb::Connection& con, const Table& table) {
+    load_named_table(con, kTable, table);
 }
 
 Cell read_value(const duckdb::Value& v, Type t) {
@@ -105,6 +110,24 @@ Cell read_value(const duckdb::Value& v, Type t) {
     return cell;
 }
 
+// Read a rendered SQL result back into a ResultSet with the given column types
+// (the single-source-of-truth output schema), in column order.
+ResultSet read_result(duckdb::MaterializedQueryResult& result,
+                      std::vector<Type> types) {
+    ResultSet rs;
+    rs.types = std::move(types);
+    const std::size_t nrow = result.RowCount();
+    const std::size_t ncol = rs.types.size();
+    for (std::size_t r = 0; r < nrow; ++r) {
+        std::vector<Cell> row;
+        row.reserve(ncol);
+        for (std::size_t c = 0; c < ncol; ++c)
+            row.push_back(read_value(result.GetValue(c, r), rs.types[c]));
+        rs.rows.push_back(std::move(row));
+    }
+    return rs;
+}
+
 }  // namespace
 
 ResultSet run_duckdb(const Table& table, const LogicalQuery& q) {
@@ -120,30 +143,44 @@ ResultSet run_duckdb(const Table& table, const LogicalQuery& q) {
 
     // Result column order/types are the single-source-of-truth output schema
     // (projection columns, or GROUP BY keys-then-aggregates).
-    ResultSet rs;
+    std::vector<Type> types;
     const Schema out = query_output_schema(table.schema(), q);
-    for (const auto& f : out.fields) rs.types.push_back(f.second);
+    for (const auto& f : out.fields) types.push_back(f.second);
+    return read_result(*result, std::move(types));
+}
 
-    const std::size_t nrow = result->RowCount();
-    const std::size_t ncol = rs.types.size();
-    for (std::size_t r = 0; r < nrow; ++r) {
-        std::vector<Cell> row;
-        row.reserve(ncol);
-        for (std::size_t c = 0; c < ncol; ++c)
-            row.push_back(read_value(result->GetValue(c, r), rs.types[c]));
-        rs.rows.push_back(std::move(row));
-    }
-    return rs;
+ResultSet run_join_duckdb(const Table& probe, const Table& build,
+                          const JoinQuery& jq) {
+    duckdb::DuckDB db(nullptr);  // in-memory
+    duckdb::Connection con(db);
+
+    load_named_table(con, "probe", probe);
+    load_named_table(con, "build", build);
+
+    const std::string sql =
+        join_sql(probe.schema(), build.schema(), jq, "probe", "build");
+    auto result = con.Query(sql);
+    if (result->HasError())
+        throw DuckDBError(result->GetError() + "  [sql: " + sql + "]");
+
+    std::vector<Type> types;
+    const Schema out = join_output_schema(probe.schema(), build.schema());
+    for (const auto& f : out.fields) types.push_back(f.second);
+    return read_result(*result, std::move(types));
 }
 
 }  // namespace qe::oracle
 
-#else  // !QE_WITH_DUCKDB — keep the symbol so a stray reference fails loudly.
+#else  // !QE_WITH_DUCKDB — keep the symbols so a stray reference fails loudly.
 
 namespace qe::oracle {
 ResultSet run_duckdb(const Table&, const LogicalQuery&) {
     throw std::logic_error(
         "run_duckdb called in a build without DuckDB (QE_WITH_DUCKDB unset)");
+}
+ResultSet run_join_duckdb(const Table&, const Table&, const JoinQuery&) {
+    throw std::logic_error(
+        "run_join_duckdb called in a build without DuckDB (QE_WITH_DUCKDB unset)");
 }
 }  // namespace qe::oracle
 

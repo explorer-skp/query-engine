@@ -23,9 +23,11 @@
 
 #include "expr/expr.h"
 #include "ops/aggregate.h"
+#include "ops/join.h"
 #include "ops/operator.h"
 #include "ops/project.h"
 #include "ops/scan.h"
+#include "ops/sort.h"
 #include "ops/table.h"
 
 namespace qe::oracle {
@@ -44,9 +46,15 @@ struct LogicalQuery {
     std::vector<Projection> projections;
     // Optional GROUP BY; when set, the query is an aggregation, not a projection.
     std::optional<GroupBy> group_by;
+    // Optional ORDER BY (WP-7): sort keys over the query's OUTPUT columns
+    // (SortKey.col is the output-column index). When present the result row order
+    // is DEFINED, so the differential compares POSITIONALLY (ORDERED mode — see
+    // oracle/result_set.h). A Sort is appended atop the projection/aggregate.
+    std::optional<std::vector<SortKey>> order_by;
 
     bool has_filter() const { return static_cast<bool>(filter); }
     bool has_group_by() const { return group_by.has_value(); }
+    bool has_order_by() const { return order_by.has_value(); }
 };
 
 // The OUTPUT schema of `q` over an input of schema `input` — the single source of
@@ -60,6 +68,33 @@ Schema query_output_schema(const Schema& input, const LogicalQuery& q);
 // `table` (which must outlive the tree). batch_size is forwarded to Scan.
 std::unique_ptr<Operator> build_engine_pipeline(
     const Table& table, const LogicalQuery& q,
+    std::size_t batch_size = Scan::kDefaultBatchSize);
+
+// ---- WP-6: two-input equi-join ---------------------------------------------
+// ONE logical description of a join that BOTH the engine tree and the oracle
+// (DuckDB SQL / the independent reference) render from, so the differential is
+// honest. The query references two external Tables, the PROBE (left) table and
+// the BUILD (right) table; `probe_keys`/`build_keys` are the equi-key column
+// indices into each table's schema (in key order, equal length), and `type` is
+// INNER or LEFT-OUTER. Output column order is the engine's: ALL probe columns
+// then ALL build columns (see ops/join.h).
+struct JoinQuery {
+    std::vector<std::uint32_t> probe_keys;
+    std::vector<std::uint32_t> build_keys;
+    JoinType type = JoinType::Inner;
+};
+
+// Output schema of a join over the given table schemas: probe fields followed by
+// build fields (single source of truth for column order/types every backend
+// renders). Names are the children's names verbatim and MAY collide across sides
+// — the comparator and renderer use position.
+Schema join_output_schema(const Schema& probe, const Schema& build);
+
+// Assemble the engine tree for `jq`: scan(probe) + scan(build) -> HashJoin. The
+// returned operator OWNS both scans; it borrows both Tables (which must outlive
+// the tree). batch_size is forwarded to BOTH scans.
+std::unique_ptr<Operator> build_join_pipeline(
+    const Table& probe, const Table& build, const JoinQuery& jq,
     std::size_t batch_size = Scan::kDefaultBatchSize);
 
 }  // namespace qe::oracle
