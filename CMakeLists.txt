@@ -241,6 +241,30 @@ else()
                  "only (stage third_party/duckdb/; see VENDORING.md)")
 endif()
 
+# --- WP-4: hash table substrate (shared by WP-5 aggregation, WP-6 join) -------
+# qe_hashtable is the open-addressing linear-probe table + its from-scratch
+# mixing hash. Only the vector kernel TU (ops/hash_kernels.cpp) pulls in Highway
+# template headers, so only that TU opts out of -Werror; the scalar twin, the
+# normalization, and the table itself keep the full gate. Links qe_core (carries
+# qe_simd/hwy transitively); pulls in NO oracle/expr code, so the from-scratch
+# grep over ops/ stays clean.
+add_library(qe_hashtable STATIC
+  ops/hashtable.cpp
+  ops/hash_internal.cpp
+  ops/hash_kernels.cpp
+  ops/hash_scalar.cpp)
+target_link_libraries(qe_hashtable PUBLIC qe_core)
+set_source_files_properties(
+  ops/hash_kernels.cpp
+  PROPERTIES COMPILE_OPTIONS "-Wno-error")
+
+# Test-only planted mutant of the hash table (broken probe / skipped rehash). NOT
+# linked into any engine target — only the WP-4 mutation self-test. Reuses
+# qe_hashtable's shared normalization/hash so the mutant differs from the real
+# table by exactly one slot/grow step.
+add_library(qe_hashtable_mutants STATIC ops/hashtable_mutants.cpp)
+target_link_libraries(qe_hashtable_mutants PUBLIC qe_hashtable)
+
 # Drivers.
 add_executable(host_state bench/host_state_main.cpp)
 target_link_libraries(host_state PRIVATE bench_infra hwy_target_probe)
@@ -360,3 +384,32 @@ add_executable(oracle_mutation_test
 target_link_libraries(oracle_mutation_test PRIVATE doctest qe_oracle)
 add_test(NAME oracle_mutation_test
   COMMAND oracle_mutation_test --seed ${QE_CI_SEED})
+
+# --- WP-4 tests. Reuse tests/wp1_test_main.cpp (prints seed; --seed N). -------
+# CI drives the randomized ones with the committed QE_CI_SEED (D13).
+add_executable(hashtable_test tests/wp1_test_main.cpp tests/hashtable_test.cpp)
+target_link_libraries(hashtable_test PRIVATE doctest qe_hashtable)
+add_test(NAME hashtable_test COMMAND hashtable_test --seed ${QE_CI_SEED})
+
+# scalar==vector for the hash kernel AND end-to-end (find via each path).
+add_executable(hashtable_scalar_vector_test
+  tests/wp1_test_main.cpp tests/hashtable_scalar_vector_test.cpp)
+target_link_libraries(hashtable_scalar_vector_test PRIVATE doctest qe_hashtable)
+add_test(NAME hashtable_scalar_vector_test
+  COMMAND hashtable_scalar_vector_test --seed ${QE_CI_SEED})
+
+# Fuzz cross-check vs a std::unordered_map reference model (collision storms,
+# growth past every resize boundary, random insert/find mixes).
+add_executable(hashtable_fuzz_test
+  tests/wp1_test_main.cpp tests/hashtable_fuzz_test.cpp)
+target_link_libraries(hashtable_fuzz_test PRIVATE doctest qe_hashtable)
+add_test(NAME hashtable_fuzz_test COMMAND hashtable_fuzz_test --seed ${QE_CI_SEED})
+
+# Mutation self-test: the reference cross-check MUST flag a broken probe / skipped
+# rehash, and pass on the real table.
+add_executable(hashtable_mutation_test
+  tests/wp1_test_main.cpp tests/hashtable_mutation_test.cpp)
+target_link_libraries(hashtable_mutation_test
+  PRIVATE doctest qe_hashtable qe_hashtable_mutants)
+add_test(NAME hashtable_mutation_test
+  COMMAND hashtable_mutation_test --seed ${QE_CI_SEED})

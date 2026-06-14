@@ -23,5 +23,31 @@ Implemented this WP:
 - **`project.{h,cpp}`** — evaluates a list of named expr trees per batch into a
   fresh dense `OwnedBatch` (the SELECT list).
 
+Added in WP-4 (the shared hash-table substrate, **`hashtable.h` FROZEN**):
+- **`hashtable.{h,cpp}`** — open-addressing, linear-probe, power-of-two table
+  (D8) shared by WP-5 (group-by) and WP-6 (join). `insert_or_find` returns a
+  stable, dense group id per distinct key (build/group path); `find` probes
+  without inserting (join probe path). Single or composite keys over
+  I32/I64/F64/BOOL/TS. F64 keys canonicalize -0.0→+0.0 and all-NaN→one NaN.
+  NULL semantics are caller-chosen via `NullPolicy` (`kEqual` = GROUP BY:
+  NULLs group together; `kNeverMatch` = join: NULLs never match) — neither baked
+  in. Group ids are stable across growth/rehash. Load factor + initial capacity
+  are named config (`HashTableConfig`), power-of-two enforced at runtime; nothing
+  hardcoded.
+- **`hash_kernels.{h,cpp}` + `hash_scalar.cpp`** — the from-scratch mixing hash
+  (splitmix64 finalizer) as a vector/scalar twin (Highway behind `_vec`;
+  independent scalar in `_scalar.cpp`). The probe/slot walk is shared scalar
+  control flow (inherently sequential); the data-parallel hashing is the
+  vectorized part. `HashPath::{kVector,kScalar}` drives the scalar==vector
+  differential end-to-end.
+- **`hash_internal.{h,cpp}`** — non-frozen seam: key normalization + per-batch
+  hashing + key equality, shared by the real table and the test-only mutant so
+  the mutant differs by exactly one probe/grow step.
+- **`hashtable_mutants.{h,cpp}`** — TEST-ONLY planted-probe mutants (skipped
+  rehash on growth; probe stops one slot early). Not linked into any engine
+  target; the mutation self-test shows the reference cross-check catches them.
+
 From-scratch: no query-engine/dataframe libraries here (the gate covers `ops/`).
 The DuckDB differential that validates these operators lives under `oracle/`.
+WP-4 is a substrate, validated by standalone unit + fuzz + scalar==vector +
+mutation self-tests (not yet the DuckDB oracle; WP-5/WP-6 wire it in there).
