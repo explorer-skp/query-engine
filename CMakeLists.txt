@@ -230,6 +230,12 @@ if(EXISTS "${QE_DUCKDB_SRC}")
   target_include_directories(qe_oracle PUBLIC
     ${CMAKE_SOURCE_DIR}/third_party/duckdb)
   target_link_libraries(qe_oracle PUBLIC duckdb_amalg)
+  # The oracle glue TU includes the vendored duckdb.hpp, whose own warnings would
+  # trip the global -Werror (same rationale as the Highway/-w exemptions). Suppress
+  # -Werror on just this TU so the third-party header can't fail our build.
+  # [reviewer integration fix at WP-3 DuckDB-staging; WP-3 worker to ratify.]
+  set_source_files_properties(oracle/duckdb_oracle.cpp PROPERTIES
+    COMPILE_OPTIONS "-Wno-error")
 else()
   message(STATUS "WP-3 oracle: DuckDB amalgamation NOT found -> reference backend "
                  "only (stage third_party/duckdb/; see VENDORING.md)")
