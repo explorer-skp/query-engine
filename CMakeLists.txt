@@ -182,6 +182,59 @@ add_library(qe_expr_mutants STATIC expr/expr_kernels_mutants.cpp)
 target_link_libraries(qe_expr_mutants PUBLIC qe_core)
 target_compile_options(qe_expr_mutants PRIVATE -Wno-error)
 
+# --- WP-3: operators (scan/filter/project) + in-memory Table source ----------
+# qe_ops is the pull-based operator layer (ops/operator.h frozen at WP-3). It
+# pulls in NO Highway directly (it goes through qe_expr -> qe_core -> qe_simd) and
+# NOTHING from oracle/tests, so the from-scratch grep over ops/ stays clean. Full
+# -Wall -Wextra -Werror (no third-party headers here).
+add_library(qe_ops STATIC
+  ops/table.cpp
+  ops/scan.cpp
+  ops/filter.cpp
+  ops/project.cpp)
+target_link_libraries(qe_ops PUBLIC qe_expr)
+
+# --- WP-3: DuckDB differential oracle (TEST/ORACLE TARGETS ONLY) -------------
+# qe_oracle is the differential harness: result-set compare (D11/D12), the
+# independent reference oracle, seeded generators, SQL rendering, and the DuckDB
+# backend. It links qe_ops (the engine under test). DuckDB is NEVER linked into
+# any engine target — only here, and only when the amalgamation is staged — so
+# the from-scratch gate over core/simd/expr/ops stays green either way.
+add_library(qe_oracle STATIC
+  oracle/result_set.cpp
+  oracle/logical_query.cpp
+  oracle/reference_oracle.cpp
+  oracle/generators.cpp
+  oracle/sql_render.cpp
+  oracle/differential.cpp
+  oracle/duckdb_oracle.cpp)
+target_link_libraries(qe_oracle PUBLIC qe_ops)
+
+# DuckDB differential backend, auto-enabled IFF the amalgamation is vendored at
+# third_party/duckdb/. The sandbox has no network, so the human pre-stages the
+# artifact named in third_party/duckdb/VENDORING.md; CMake then sets
+# QE_WITH_DUCKDB (PUBLIC -> visible to oracle TUs and to the test TUs that query
+# duckdb_available()) and links the compiled amalgamation. Absent it, the oracle
+# runs the independent reference backend alone and CI stays green.
+set(QE_DUCKDB_SRC "${CMAKE_SOURCE_DIR}/third_party/duckdb/duckdb.cpp")
+if(EXISTS "${QE_DUCKDB_SRC}")
+  message(STATUS "WP-3 oracle: DuckDB amalgamation FOUND -> DuckDB backend ENABLED")
+  add_library(duckdb_amalg STATIC "${QE_DUCKDB_SRC}")
+  target_include_directories(duckdb_amalg PUBLIC
+    ${CMAKE_SOURCE_DIR}/third_party/duckdb)
+  # Vendored third-party TU: silence ALL warnings so the global -Werror can't
+  # fail on code we do not own (mirrors the Highway -Wno-error treatment).
+  target_compile_options(duckdb_amalg PRIVATE -w)
+  target_link_libraries(duckdb_amalg PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+  target_compile_definitions(qe_oracle PUBLIC QE_WITH_DUCKDB)
+  target_include_directories(qe_oracle PUBLIC
+    ${CMAKE_SOURCE_DIR}/third_party/duckdb)
+  target_link_libraries(qe_oracle PUBLIC duckdb_amalg)
+else()
+  message(STATUS "WP-3 oracle: DuckDB amalgamation NOT found -> reference backend "
+                 "only (stage third_party/duckdb/; see VENDORING.md)")
+endif()
+
 # Drivers.
 add_executable(host_state bench/host_state_main.cpp)
 target_link_libraries(host_state PRIVATE bench_infra hwy_target_probe)
@@ -280,3 +333,24 @@ add_executable(expr_mutation_test
 target_link_libraries(expr_mutation_test PRIVATE doctest qe_expr qe_expr_mutants)
 add_test(NAME expr_mutation_test
   COMMAND expr_mutation_test --seed ${QE_CI_SEED})
+
+# --- WP-3 tests. Reuse tests/wp1_test_main.cpp (prints seed; --seed N). -------
+# All three link qe_oracle (which carries qe_ops -> qe_expr -> qe_core/simd, and,
+# when staged, the DuckDB backend). CI drives them with the committed QE_CI_SEED.
+add_executable(ops_test tests/wp1_test_main.cpp tests/ops_test.cpp)
+target_link_libraries(ops_test PRIVATE doctest qe_oracle)
+add_test(NAME ops_test COMMAND ops_test --seed ${QE_CI_SEED})
+
+# The M1 proof: first end-to-end scan->filter->project diffs green vs the oracle.
+add_executable(oracle_differential_test
+  tests/wp1_test_main.cpp tests/oracle_differential_test.cpp)
+target_link_libraries(oracle_differential_test PRIVATE doctest qe_oracle)
+add_test(NAME oracle_differential_test
+  COMMAND oracle_differential_test --seed ${QE_CI_SEED})
+
+# Mutation self-test #1: the differential MUST flag a corrupted filter / scan.
+add_executable(oracle_mutation_test
+  tests/wp1_test_main.cpp tests/oracle_mutation_test.cpp)
+target_link_libraries(oracle_mutation_test PRIVATE doctest qe_oracle)
+add_test(NAME oracle_mutation_test
+  COMMAND oracle_mutation_test --seed ${QE_CI_SEED})

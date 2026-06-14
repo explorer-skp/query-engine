@@ -1,0 +1,6 @@
+# The DuckDB amalgamation is pre-staged locally (see VENDORING.md), not committed
+# — it is large and lives only in test/oracle builds. Track only the docs.
+duckdb.hpp
+duckdb.h
+duckdb.cpp
+*.zip
