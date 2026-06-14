@@ -150,6 +150,38 @@ add_library(qe_validity_mutants STATIC simd/validity_kernels_mutants.cpp)
 target_link_libraries(qe_validity_mutants PUBLIC hwy)
 target_compile_options(qe_validity_mutants PRIVATE -Wno-error)
 
+# --- WP-2: expression IR + vectorized/scalar kernels + evaluation ------------
+# qe_expr is the expression engine: the IR + type inference (expr.cpp), the
+# tree-walking evaluator that owns NULL propagation (eval.cpp), and the op×type
+# kernel matrix as vector/scalar twins. Only the *_kernels.cpp (vector) TUs pull
+# in Highway template headers, so only those opt out of -Werror; the scalar
+# twins and the IR/eval keep the full gate. Links qe_core (OwnedColumn + WP-1
+# validity kernels), which carries qe_simd/hwy transitively.
+add_library(qe_expr STATIC
+  expr/expr.cpp
+  expr/eval.cpp
+  expr/arith_kernels.cpp
+  expr/arith_scalar.cpp
+  expr/compare_kernels.cpp
+  expr/compare_scalar.cpp
+  expr/logic_kernels.cpp
+  expr/logic_scalar.cpp
+  expr/cast_kernels.cpp
+  expr/cast_scalar.cpp)
+target_link_libraries(qe_expr PUBLIC qe_core)
+set_source_files_properties(
+  expr/arith_kernels.cpp
+  expr/compare_kernels.cpp
+  expr/logic_kernels.cpp
+  expr/cast_kernels.cpp
+  PROPERTIES COMPILE_OPTIONS "-Wno-error")
+
+# Test-only planted mutants of the expression kernels / null-propagation (see
+# the WP-2 mutation self-test). NOT linked into any engine target. Highway TU.
+add_library(qe_expr_mutants STATIC expr/expr_kernels_mutants.cpp)
+target_link_libraries(qe_expr_mutants PUBLIC qe_core)
+target_compile_options(qe_expr_mutants PRIVATE -Wno-error)
+
 # Drivers.
 add_executable(host_state bench/host_state_main.cpp)
 target_link_libraries(host_state PRIVATE bench_infra hwy_target_probe)
@@ -208,3 +240,43 @@ add_executable(validity_mutation_test
 target_link_libraries(validity_mutation_test
   PRIVATE doctest qe_core qe_validity_mutants)
 add_test(NAME validity_mutation_test COMMAND validity_mutation_test)
+
+# --- WP-2 tests. Reuse tests/wp1_test_main.cpp (prints seed; --seed N). ------
+# CI determinism (D13): ctest runs every randomized WP-2 test with a FIXED,
+# committed seed, so "green" is reproducible — not luck of a fresh random seed.
+# Discovery/fuzz mode is still available by running the binary with NO --seed
+# (a new seed is chosen and printed each run; replay any failure with --seed N).
+# QE_CI_SEED is the standing CI seed; QE_PINNED_SEED replays the pinned cast bug.
+set(QE_CI_SEED 20260614)
+set(QE_PINNED_SEED 14745959599513406255)
+
+add_executable(expr_scalar_vector_test
+  tests/wp1_test_main.cpp tests/expr_scalar_vector_test.cpp)
+target_link_libraries(expr_scalar_vector_test PRIVATE doctest qe_expr)
+add_test(NAME expr_scalar_vector_test
+  COMMAND expr_scalar_vector_test --seed ${QE_CI_SEED})
+
+add_executable(expr_null_truthtable_test
+  tests/wp1_test_main.cpp tests/expr_null_truthtable_test.cpp)
+target_link_libraries(expr_null_truthtable_test PRIVATE doctest qe_expr)
+add_test(NAME expr_null_truthtable_test
+  COMMAND expr_null_truthtable_test --seed ${QE_CI_SEED})
+
+add_executable(expr_property_test
+  tests/wp1_test_main.cpp tests/expr_property_test.cpp)
+target_link_libraries(expr_property_test PRIVATE doctest qe_expr)
+add_test(NAME expr_property_test
+  COMMAND expr_property_test --seed ${QE_CI_SEED})
+
+# Permanent REGRESSION for the pinned F64->I64 cast tail/rounding bug: replays the
+# exact failing tree from the seed that first exposed it. Fails before the
+# RoundAway fix (cast_kernels.cpp), passes after — so the bug cannot silently
+# return. (The direct value-level regression lives in expr_scalar_vector_test.)
+add_test(NAME expr_property_pinned_castbug
+  COMMAND expr_property_test --seed ${QE_PINNED_SEED})
+
+add_executable(expr_mutation_test
+  tests/wp1_test_main.cpp tests/expr_mutation_test.cpp)
+target_link_libraries(expr_mutation_test PRIVATE doctest qe_expr qe_expr_mutants)
+add_test(NAME expr_mutation_test
+  COMMAND expr_mutation_test --seed ${QE_CI_SEED})
