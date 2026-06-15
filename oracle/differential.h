@@ -19,6 +19,7 @@
 #include "oracle/result_set.h"
 #include "ops/scan.h"
 #include "ops/table.h"
+#include "plan/plan.h"
 
 namespace qe::oracle {
 
@@ -51,5 +52,21 @@ DiffResult run_join_differential(const Table& probe, const Table& build,
 DiffResult run_join_vs_reference(
     const Table& probe, const Table& build, const JoinQuery& jq,
     std::size_t batch_size = Scan::kDefaultBatchSize);
+
+// ---- WP-8: plan differential -----------------------------------------------
+// A plan oracle is `(plan::Plan) -> ResultSet`, so the SAME runner + comparator
+// serve both backends (independent plan reference / DuckDB). The runner LOWERS the
+// plan to the engine tree and runs `oracle` over the SAME plan — one description,
+// both backends. A plan whose ROOT is Sort defines the row order, so the diff is
+// POSITIONAL (ORDERED); otherwise it canonicalizes (D12).
+using PlanOracleFn = std::function<ResultSet(const qe::plan::Plan&)>;
+
+DiffResult run_plan_differential(
+    const qe::plan::Plan& p, const PlanOracleFn& oracle,
+    std::size_t batch_size = Scan::kDefaultBatchSize);
+
+// Convenience: engine plan vs the independent plan reference.
+DiffResult run_plan_vs_reference(
+    const qe::plan::Plan& p, std::size_t batch_size = Scan::kDefaultBatchSize);
 
 }  // namespace qe::oracle

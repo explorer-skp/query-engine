@@ -123,9 +123,8 @@ std::string create_table_sql(const std::string& name, const Schema& schema) {
     return os.str();
 }
 
-namespace {
-
 // The aggregate function call SQL, e.g. "SUM(c2)". CountStar is "COUNT(*)".
+// Public (declared in sql_render.h) so the plan->SQL renderer reuses it.
 std::string agg_call_sql(const AggSpec& a, const Schema& schema) {
     if (a.func == AggFunc::CountStar) return "COUNT(*)";
     const std::string& col = schema.fields[a.input_col].first;
@@ -139,6 +138,24 @@ std::string agg_call_sql(const AggSpec& a, const Schema& schema) {
     }
     return "COUNT(*)";  // unreachable
 }
+
+// "ORDER BY ..." by 1-based output ordinal, explicit dir + null order. Empty when
+// there are no keys.
+std::string order_by_sql(const std::vector<SortKey>& keys) {
+    if (keys.empty()) return "";
+    std::ostringstream os;
+    os << "ORDER BY ";
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (i) os << ", ";
+        os << (keys[i].col + 1)
+           << (keys[i].dir == SortDir::Desc ? " DESC" : " ASC")
+           << (keys[i].nulls == NullOrder::First ? " NULLS FIRST"
+                                                 : " NULLS LAST");
+    }
+    return os.str();
+}
+
+namespace {
 
 // Render a group-by query. Each output column is wrapped in a CAST to the
 // engine's result type so the DuckDB column type matches EXACTLY. The CAST on
@@ -189,17 +206,7 @@ std::string group_by_sql(const std::string& name, const Schema& schema,
 // order. Empty when the query has no ORDER BY.
 std::string order_by_clause(const LogicalQuery& q) {
     if (!q.has_order_by()) return "";
-    std::ostringstream os;
-    os << " ORDER BY ";
-    const auto& keys = *q.order_by;
-    for (std::size_t i = 0; i < keys.size(); ++i) {
-        if (i) os << ", ";
-        os << (keys[i].col + 1)
-           << (keys[i].dir == SortDir::Desc ? " DESC" : " ASC")
-           << (keys[i].nulls == NullOrder::First ? " NULLS FIRST"
-                                                 : " NULLS LAST");
-    }
-    return os.str();
+    return " " + order_by_sql(*q.order_by);  // shared renderer (WP-8)
 }
 
 }  // namespace

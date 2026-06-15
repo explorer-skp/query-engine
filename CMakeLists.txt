@@ -207,6 +207,21 @@ set_source_files_properties(
   ops/agg_kernels.cpp
   PROPERTIES COMPILE_OPTIONS "-Wno-error")
 
+# --- WP-8: physical plan nodes + dataframe builder API + lowering + print -----
+# qe_plan is the engine-side plan layer (plan/plan.h is WP-8's public surface).
+# It links qe_ops (Scan/Filter/Project/Aggregate/HashJoin/Sort + Table + expr) and
+# pulls in NO Highway directly and NOTHING from oracle/tests, so the from-scratch
+# grep over plan/ stays clean. Full -Wall -Wextra -Werror (no third-party headers).
+add_library(qe_plan STATIC plan/plan.cpp)
+target_link_libraries(qe_plan PUBLIC qe_ops)
+
+# Test-only planted mutant LOWERING (drop filter / swap join sides / reverse agg
+# keys / drop sort). NOT linked into any engine target — only the WP-8 mutation
+# self-test. Reuses qe_plan's public Plan surface so it differs from Plan::lower()
+# by exactly one mis-lowered node.
+add_library(qe_plan_mutants STATIC plan/plan_mutants.cpp)
+target_link_libraries(qe_plan_mutants PUBLIC qe_plan)
+
 # --- WP-3: DuckDB differential oracle (TEST/ORACLE TARGETS ONLY) -------------
 # qe_oracle is the differential harness: result-set compare (D11/D12), the
 # independent reference oracle, seeded generators, SQL rendering, and the DuckDB
@@ -219,9 +234,12 @@ add_library(qe_oracle STATIC
   oracle/reference_oracle.cpp
   oracle/generators.cpp
   oracle/sql_render.cpp
+  oracle/plan_sql.cpp
   oracle/differential.cpp
   oracle/duckdb_oracle.cpp)
-target_link_libraries(qe_oracle PUBLIC qe_ops)
+# Links qe_plan (WP-8): the oracle renders/lowers plan::Plan through it (the
+# single source of truth feeding engine + DuckDB).
+target_link_libraries(qe_oracle PUBLIC qe_ops qe_plan)
 
 # DuckDB differential backend, auto-enabled IFF the amalgamation is vendored at
 # third_party/duckdb/. The sandbox has no network, so the human pre-stages the
@@ -536,3 +554,30 @@ add_test(NAME sort_mutation_test
 # (RIGOR.md §2). Built from the Release config; see the WP report for the command.
 add_executable(bench_sort bench/bench_sort_main.cpp)
 target_link_libraries(bench_sort PRIVATE qe_ops bench_infra hwy_target_probe)
+
+# --- WP-8 tests: plan + dataframe builder API. Closes M2. ---------------------
+# Printable round-trip (no randomness => plain doctest main). Links qe_plan only
+# (Table + builder); asserts an exact canonical rendering, stability, and that a
+# structural change is visible.
+add_executable(plan_print_test tests/test_main.cpp tests/plan_print_test.cpp)
+target_link_libraries(plan_print_test PRIVATE doctest qe_plan)
+add_test(NAME plan_print_test COMMAND plan_print_test)
+
+# The M2-close proof: the builder reproduces every WP-3..WP-7 shape PLUS a deep
+# composite pipeline, each diffing green vs the plan reference (and DuckDB when
+# staged) through ONE plan that drives both backends. CI pins QE_CI_SEED (D13).
+add_executable(plan_differential_test
+  tests/wp1_test_main.cpp tests/plan_differential_test.cpp)
+target_link_libraries(plan_differential_test PRIVATE doctest qe_oracle)
+add_test(NAME plan_differential_test
+  COMMAND plan_differential_test --seed ${QE_CI_SEED})
+
+# Mutation self-test: the plan differential MUST flag a mis-LOWERED plan (dropped
+# filter / swapped join sides / reversed agg keys / dropped sort), and pass on the
+# correct Plan::lower().
+add_executable(plan_mutation_test
+  tests/wp1_test_main.cpp tests/plan_mutation_test.cpp)
+target_link_libraries(plan_mutation_test
+  PRIVATE doctest qe_oracle qe_plan_mutants)
+add_test(NAME plan_mutation_test
+  COMMAND plan_mutation_test --seed ${QE_CI_SEED})

@@ -29,6 +29,17 @@ std::string sql_type(Type t);
 // Render an expression to SQL, resolving column refs against `schema`'s names.
 std::string expr_to_sql(const expr::Expr& e, const Schema& schema);
 
+// The aggregate function call SQL for `a`, resolving its input column against
+// `schema`'s names, e.g. "SUM(c2)"; CountStar is "COUNT(*)". Exposed (WP-8) so the
+// plan->SQL renderer (oracle/plan_sql.cpp) reuses it rather than duplicating it.
+std::string agg_call_sql(const AggSpec& a, const Schema& schema);
+
+// The "ORDER BY ..." clause for `keys`, rendered by 1-based OUTPUT ORDINAL (so it
+// binds to the SELECT position regardless of names) with explicit ASC/DESC and
+// NULLS FIRST/LAST (never relying on a backend default). Empty string when `keys`
+// is empty. Exposed (WP-8) so both select_sql and the plan->SQL renderer share it.
+std::string order_by_sql(const std::vector<SortKey>& keys);
+
 // "CREATE TABLE <name>(c0 TYPE, c1 TYPE, ...)" for `schema`.
 std::string create_table_sql(const std::string& name, const Schema& schema);
 

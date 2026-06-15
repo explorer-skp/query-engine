@@ -421,6 +421,67 @@ JoinCase gen_join_case(std::mt19937_64& rng) {
     return JoinCase{std::move(probe), std::move(build), std::move(q)};
 }
 
+PlanCase gen_plan_case(std::mt19937_64& rng) {
+    // Two correlated tables (probe/build) sharing key column(s) 0..nk-1.
+    JoinCase jc = gen_join_case(rng);
+
+    PlanCase out;
+    out.tables.push_back(std::make_unique<Table>(std::move(jc.probe)));
+    out.tables.push_back(std::make_unique<Table>(std::move(jc.build)));
+    const Table& probe = *out.tables[0];
+    const Table& build = *out.tables[1];
+
+    plan::PlanBuilder b = plan::scan(probe);
+
+    // ~50% prepend a filter on probe key column 0 (always numeric/TS key type),
+    // exercising filter-before-join composition.
+    if (rng() % 2 == 0) {
+        const Type kt = probe.schema().fields[0].second;
+        Expr rhs;
+        switch (kt) {
+            case Type::I32: rhs = lit(Scalar::i32(50)); break;
+            case Type::I64: rhs = lit(Scalar::i64(50)); break;
+            case Type::F64: rhs = lit(Scalar::f64(50.0)); break;
+            case Type::TS:  rhs = lit(Scalar::ts(50)); break;
+            case Type::BOOL: rhs = lit(Scalar::i32(50)); break;  // unreachable
+        }
+        b = b.filter(cmp(CmpOp::Lt, col(kt, 0), std::move(rhs)));
+    }
+
+    // Join probe |x| build on the generated equi-keys.
+    std::vector<plan::ColRef> lk, rk;
+    for (auto i : jc.query.probe_keys)
+        lk.push_back(plan::ColRef(static_cast<int>(i)));
+    for (auto i : jc.query.build_keys)
+        rk.push_back(plan::ColRef(static_cast<int>(i)));
+    b = b.join(plan::scan(build), lk, rk, jc.query.type);
+
+    // Aggregate over the join output: GROUP BY the (probe) key column 0, with only
+    // overflow-proof aggregates (COUNT(*)/COUNT/MIN/MAX) so the diff is exact.
+    const std::uint32_t njoin =
+        static_cast<std::uint32_t>(b.schema().fields.size());
+    std::vector<AggSpec> aggs;
+    aggs.push_back(AggSpec::count_star("a0"));
+    aggs.push_back(AggSpec::min(0, "a1"));
+    aggs.push_back(AggSpec::max(0, "a2"));
+    aggs.push_back(AggSpec::count(
+        static_cast<std::uint32_t>(rng() % njoin), "a3"));
+    b = b.aggregate({0}, std::move(aggs));
+
+    // ORDER BY every output column ASC NULLS LAST: groups are distinct by the key,
+    // so column 0 alone already makes the order TOTAL; appending the rest is
+    // belt-and-suspenders for positional compare.
+    std::vector<SortKey> sk;
+    const std::uint32_t nout =
+        static_cast<std::uint32_t>(b.schema().fields.size());
+    for (std::uint32_t i = 0; i < nout; ++i)
+        sk.push_back(SortKey{i, SortDir::Asc, NullOrder::Last});
+    b = b.sort(std::move(sk));
+
+    out.plan = b.plan();
+    return out;
+}
+
 LogicalQuery gen_order_by_query(std::mt19937_64& rng, const Schema& schema) {
     const Cols c = classify(schema);
     const std::uint32_t ncols = static_cast<std::uint32_t>(schema.fields.size());

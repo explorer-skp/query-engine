@@ -17,10 +17,21 @@
 #include "oracle/logical_query.h"
 #include "oracle/result_set.h"
 #include "ops/table.h"
+#include "plan/plan.h"
 
 namespace qe::oracle {
 
 ResultSet run_reference(const Table& table, const LogicalQuery& q);
+
+// WP-8: the INDEPENDENT reference for an arbitrary plan::Plan tree. It walks the
+// plan bottom-up, MATERIALIZING each node's output as a Table and computing that
+// node with the EXISTING per-node references (run_reference for
+// scan/filter/project/group-by/order-by, run_join_reference for join). It shares
+// NO code path with the engine's operator tree (plan.lower()), so "engine ==
+// reference" is a meaningful differential of the WHOLE composition (alongside the
+// authoritative DuckDB plan diff). The borrowed Table(s) the plan's Scan nodes
+// reference must outlive this call.
+ResultSet run_plan_reference(const qe::plan::Plan& p);
 
 // WP-6: the INDEPENDENT reference for a two-input equi-join. Computes the join
 // DIRECTLY with a std::map keyed by the canonical build-key tuple plus a nested

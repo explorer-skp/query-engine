@@ -17,6 +17,7 @@
 #include "oracle/logical_query.h"
 #include "oracle/result_set.h"
 #include "ops/table.h"
+#include "plan/plan.h"
 
 namespace qe::oracle {
 
@@ -46,5 +47,12 @@ ResultSet run_duckdb(const Table& table, const LogicalQuery& q);
 // golden model (D16). Only available when duckdb_available().
 ResultSet run_join_duckdb(const Table& probe, const Table& build,
                           const JoinQuery& jq);
+
+// WP-8: run an arbitrary plan::Plan through DuckDB and return its result set.
+// Renders the plan to one composable SQL query (oracle/plan_sql.h), loads each
+// base Table the plan scans, runs it, and reads back into a ResultSet feeding the
+// IDENTICAL comparator. Authoritative golden model (D16). Only available when
+// duckdb_available().
+ResultSet run_plan_duckdb(const qe::plan::Plan& p);
 
 }  // namespace qe::oracle

@@ -18,6 +18,7 @@
 #include "core/column.h"
 #include "core/validity.h"
 #include "duckdb.hpp"
+#include "oracle/plan_sql.h"
 #include "oracle/sql_render.h"
 
 namespace qe::oracle {
@@ -169,6 +170,23 @@ ResultSet run_join_duckdb(const Table& probe, const Table& build,
     return read_result(*result, std::move(types));
 }
 
+ResultSet run_plan_duckdb(const qe::plan::Plan& p) {
+    duckdb::DuckDB db(nullptr);  // in-memory
+    duckdb::Connection con(db);
+
+    const PlanSql ps = render_plan_sql(p);
+    for (const auto& [name, tbl] : ps.tables) load_named_table(con, name, *tbl);
+
+    auto result = con.Query(ps.sql);
+    if (result->HasError())
+        throw DuckDBError(result->GetError() + "  [sql: " + ps.sql + "]");
+
+    // Result column order/types are the plan's output schema, positionally.
+    std::vector<Type> types;
+    for (const auto& f : p.output_schema().fields) types.push_back(f.second);
+    return read_result(*result, std::move(types));
+}
+
 }  // namespace qe::oracle
 
 #else  // !QE_WITH_DUCKDB — keep the symbols so a stray reference fails loudly.
@@ -181,6 +199,10 @@ ResultSet run_duckdb(const Table&, const LogicalQuery&) {
 ResultSet run_join_duckdb(const Table&, const Table&, const JoinQuery&) {
     throw std::logic_error(
         "run_join_duckdb called in a build without DuckDB (QE_WITH_DUCKDB unset)");
+}
+ResultSet run_plan_duckdb(const qe::plan::Plan&) {
+    throw std::logic_error(
+        "run_plan_duckdb called in a build without DuckDB (QE_WITH_DUCKDB unset)");
 }
 }  // namespace qe::oracle
 

@@ -22,10 +22,13 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <random>
+#include <vector>
 
 #include "oracle/logical_query.h"
 #include "ops/table.h"
+#include "plan/plan.h"
 
 namespace qe::oracle {
 
@@ -95,5 +98,21 @@ LogicalQuery gen_group_by_query(std::mt19937_64& rng, const Schema& schema);
 // emit finite, non-NaN, non-(-0.0) floats (see above), so F64 ordering is fully
 // determined and matches DuckDB. See the WP-7 report on float/NaN determinism.
 LogicalQuery gen_order_by_query(std::mt19937_64& rng, const Schema& schema);
+
+// WP-8: a generated DEEP composite PLAN case — a pipeline no single earlier WP
+// exercises: scan(probe) -> [filter] -> join(scan(build)) -> aggregate -> sort.
+// Built on gen_join_case (two correlated tables sharing key column(s)); the
+// aggregates are overflow-proof (COUNT/MIN/MAX) and the final ORDER BY spans every
+// output column (a TOTAL order over rows distinct by group key), so the positional
+// differential is unambiguous and DuckDB-exact. The Tables live in `tables` as
+// std::unique_ptr (STABLE addresses) because the Plan's Scan nodes BORROW them:
+// moving the PlanCase must not dangle those pointers. The seed is printed by the
+// harness for replay.
+struct PlanCase {
+    std::vector<std::unique_ptr<Table>> tables;  // stable storage for Scan borrows
+    qe::plan::Plan plan;
+};
+
+PlanCase gen_plan_case(std::mt19937_64& rng);
 
 }  // namespace qe::oracle

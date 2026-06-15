@@ -535,4 +535,117 @@ ResultSet run_join_reference(const Table& probe, const Table& build,
     return rs;
 }
 
+// ---- WP-8: plan reference interpreter --------------------------------------
+namespace {
+
+// Materialize a ResultSet back into a Table of `schema` (the dense, owned form the
+// per-node references consume). Independent of the engine; pure cell copying.
+Table rs_to_table(const ResultSet& rs, const Schema& schema) {
+    const std::size_t n = rs.num_rows();
+    std::vector<OwnedColumn> cols;
+    cols.reserve(schema.fields.size());
+    for (std::size_t c = 0; c < schema.fields.size(); ++c) {
+        const Type t = schema.fields[c].second;
+        OwnedColumn oc = OwnedColumn::make(t, n);
+        std::byte* d = oc.mutable_data();
+        for (std::size_t r = 0; r < n; ++r) {
+            const Cell& cell = rs.rows[r][c];
+            if (cell.is_null) {
+                oc.set_null(r);
+                continue;
+            }
+            switch (t) {
+                case Type::I32:
+                    reinterpret_cast<std::int32_t*>(d)[r] =
+                        static_cast<std::int32_t>(cell.i);
+                    break;
+                case Type::I64:
+                case Type::TS:
+                    reinterpret_cast<std::int64_t*>(d)[r] = cell.i;
+                    break;
+                case Type::BOOL:
+                    reinterpret_cast<std::uint8_t*>(d)[r] =
+                        static_cast<std::uint8_t>(cell.i ? 1 : 0);
+                    break;
+                case Type::F64:
+                    reinterpret_cast<double*>(d)[r] = cell.f;
+                    break;
+            }
+        }
+        cols.push_back(std::move(oc));
+    }
+    return Table(schema, std::move(cols));
+}
+
+// The identity SELECT (every column as-is) over `schema` — used to express Scan,
+// Filter, and Sort as a run_reference() call (which always projects).
+std::vector<Projection> identity_projections(const Schema& schema) {
+    std::vector<Projection> ps;
+    ps.reserve(schema.fields.size());
+    for (std::uint32_t i = 0; i < schema.fields.size(); ++i)
+        ps.push_back(Projection{"c" + std::to_string(i),
+                                expr::col(schema.fields[i].second, i)});
+    return ps;
+}
+
+using qe::plan::Plan;
+using qe::plan::PlanKind;
+using qe::plan::PlanNode;
+
+// Evaluate a plan node to a ResultSet by composing the existing references over a
+// materialized child Table (or two, for Join).
+ResultSet eval_rs(const Plan& p) {
+    const PlanNode& n = p.node();
+    switch (n.kind) {
+        case PlanKind::Scan: {
+            LogicalQuery q;
+            q.projections = identity_projections(n.table->schema());
+            return run_reference(*n.table, q);
+        }
+        case PlanKind::Filter: {
+            const Plan& c = n.children[0];
+            const Table ct = rs_to_table(eval_rs(c), c.output_schema());
+            LogicalQuery q;
+            q.filter = n.predicate;
+            q.projections = identity_projections(ct.schema());
+            return run_reference(ct, q);
+        }
+        case PlanKind::Project: {
+            const Plan& c = n.children[0];
+            const Table ct = rs_to_table(eval_rs(c), c.output_schema());
+            LogicalQuery q;
+            q.projections = n.projections;
+            return run_reference(ct, q);
+        }
+        case PlanKind::Aggregate: {
+            const Plan& c = n.children[0];
+            const Table ct = rs_to_table(eval_rs(c), c.output_schema());
+            LogicalQuery q;
+            q.group_by = GroupBy{n.group_keys, n.aggs};
+            return run_reference(ct, q);
+        }
+        case PlanKind::Join: {
+            const Plan& l = n.children[0];
+            const Plan& r = n.children[1];
+            const Table lt = rs_to_table(eval_rs(l), l.output_schema());
+            const Table rt = rs_to_table(eval_rs(r), r.output_schema());
+            JoinQuery jq{n.left_keys, n.right_keys, n.join_type};
+            return run_join_reference(lt, rt, jq);
+        }
+        case PlanKind::Sort: {
+            const Plan& c = n.children[0];
+            const Table ct = rs_to_table(eval_rs(c), c.output_schema());
+            LogicalQuery q;
+            q.projections = identity_projections(ct.schema());
+            q.order_by = n.sort_keys;
+            return run_reference(ct, q);
+        }
+    }
+    return {};  // unreachable
+}
+
+}  // namespace
+
+ResultSet run_plan_reference(const qe::plan::Plan& p) { return eval_rs(p); }
+
 }  // namespace qe::oracle

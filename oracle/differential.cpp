@@ -39,4 +39,20 @@ DiffResult run_join_vs_reference(const Table& probe, const Table& build,
                                  batch_size);
 }
 
+DiffResult run_plan_differential(const qe::plan::Plan& p,
+                                 const PlanOracleFn& oracle,
+                                 std::size_t batch_size) {
+    std::unique_ptr<Operator> tree = p.lower(batch_size);
+    const ResultSet engine = drain_operator(*tree);
+    const ResultSet golden = oracle(p);
+    // A plan ending in Sort defines the row order => POSITIONAL compare (WP-7).
+    const bool ordered = p.kind() == qe::plan::PlanKind::Sort;
+    return compare_result_sets(engine, golden, ordered);
+}
+
+DiffResult run_plan_vs_reference(const qe::plan::Plan& p,
+                                 std::size_t batch_size) {
+    return run_plan_differential(p, run_plan_reference, batch_size);
+}
+
 }  // namespace qe::oracle
