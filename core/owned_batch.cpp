@@ -92,6 +92,19 @@ Batch OwnedBatch::view() const {
 OwnedColumn compact_column(const Column& in, const SelectionVector* sel,
                            std::size_t n) {
     OwnedColumn out = OwnedColumn::make(in.type, n);
+
+    // n==0 (a 0-row selection or an empty input column): a 0-length result is the
+    // right answer — a valid, dense, all-valid EMPTY OwnedColumn of `in.type`. We
+    // MUST return here before the out-of-place assert and the gather: with n==0,
+    // OwnedColumn::make allocates a 0-byte Buffer whose data() is nullptr, and an
+    // empty input column's data is likewise nullptr, so `out.data() != in.data`
+    // would be nullptr != nullptr == false and ABORT — the carry-forward (1) bug:
+    // a plan whose filter selects nothing / a global aggregate over empty input.
+    // The gather/validity loops below are already no-ops at n==0; the only thing
+    // standing in the way was the assert, which assumes nonempty buffers. Signature
+    // unchanged (WP-15 pinned-bug candidate; see tests/compact_empty_test.cpp).
+    if (n == 0) return out;
+
     const std::uint32_t* idx = sel ? sel->idx : nullptr;
 
     // Gather the data by lane width. out and in own distinct Buffers => no alias.

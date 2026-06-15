@@ -581,3 +581,117 @@ target_link_libraries(plan_mutation_test
   PRIVATE doctest qe_oracle qe_plan_mutants)
 add_test(NAME plan_mutation_test
   COMMAND plan_mutation_test --seed ${QE_CI_SEED})
+
+# ============================================================================
+# WP-10: benchmark harness (cross-cutting). Measures the finished Phase-1 engine
+# credibly — vec-vs-scalar per-operator ratios, engine-vs-DuckDB ratio, a roofline
+# framing, a validity gate that REJECTS contaminated runs, and coordinated-
+# omission-correct sustained latency. Mac numbers are preliminary / relative-only
+# (RIGOR.md §2); the same drivers rerun on x86 UNCHANGED (nothing hardcodes
+# width/cache/core-count/ISA). The reusable timing/reporting/gate code joins
+# bench_infra so every driver and self-test shares one implementation.
+# ============================================================================
+
+# Harness helpers + validity gate join the harvested rigor library. No engine and
+# no Highway deps -> bench_infra stays reusable on x86 unchanged.
+target_sources(bench_infra PRIVATE
+  bench/bench_harness.cpp
+  bench/validity_gate.cpp)
+
+# Vec-vs-scalar per-operator driver: drives the expr/hashtable/aggregate/sort path
+# seams the operators already expose (no new kernels). Gate-checks before report.
+add_executable(bench_ops bench/bench_ops_main.cpp)
+target_link_libraries(bench_ops
+  PRIVATE qe_plan bench_infra hwy_target_probe)  # qe_plan carries qe_ops
+
+# Engine-vs-DuckDB ratio driver: ONE Plan, both backends. DuckDB is timed only
+# when the amalgamation is staged (QE_WITH_DUCKDB, carried by qe_oracle); absent
+# it the driver emits engine-only timings and says so.
+add_executable(bench_engine_vs_duckdb bench/bench_engine_vs_duckdb_main.cpp)
+target_link_libraries(bench_engine_vs_duckdb
+  PRIVATE qe_oracle qe_plan bench_infra hwy_target_probe)
+
+# Sustained coordinated-omission driver: a real engine query under open-loop load,
+# measured from intended send time; --inject-stall-ms demonstrates the correction.
+add_executable(bench_sustained bench/bench_sustained_main.cpp)
+target_link_libraries(bench_sustained
+  PRIVATE qe_plan bench_infra hwy_target_probe)
+
+# Validity-gate self-test: the gate MUST be shown to bite — static reasons
+# (load/thermal/governor) plus the quiescence probe under deliberate
+# oversubscription. Links bench_infra only (no engine).
+add_executable(validity_gate_test
+  tests/test_main.cpp tests/validity_gate_test.cpp)
+target_link_libraries(validity_gate_test PRIVATE doctest bench_infra)
+add_test(NAME validity_gate_test COMMAND validity_gate_test)
+set_tests_properties(validity_gate_test PROPERTIES TIMEOUT 120)
+
+# Coordinated-omission self-test on the REAL engine: an injected stall must move
+# the INTENDED-send-time tail while the ACTUAL tail hides it. Links qe_plan (the
+# query under load) + bench_infra (the load harness). Wall-clock ~5s.
+add_executable(co_engine_selftest_test
+  tests/wp1_test_main.cpp tests/co_engine_selftest_test.cpp)
+target_link_libraries(co_engine_selftest_test
+  PRIVATE doctest qe_plan bench_infra)
+add_test(NAME co_engine_selftest_test
+  COMMAND co_engine_selftest_test --seed ${QE_CI_SEED})
+set_tests_properties(co_engine_selftest_test PROPERTIES TIMEOUT 180)
+
+# ============================================================================
+# WP-9: oracle & fuzz framework HARDENING — the consolidated mutation catalog +
+# meta-test, the 0-row differential cases, and the compact_column(n==0) regression
+# (carry-forward (1) fix lives in core/owned_batch.cpp, signature unchanged). No
+# new engine kernel here (scalar-twin rule N/A); DuckDB/SQLite stay confined to
+# oracle/ + third_party/ (the forbidden-include gate is unaffected).
+# ============================================================================
+
+# REGRESSION for carry-forward (1): compact_column(n==0). Deterministic (no
+# randomness) -> plain doctest main; links qe_core only. FAILS (aborts) before the
+# core/owned_batch.cpp fix, PASSES after.
+add_executable(compact_empty_test
+  tests/test_main.cpp tests/compact_empty_test.cpp)
+target_link_libraries(compact_empty_test PRIVATE doctest qe_core)
+add_test(NAME compact_empty_test COMMAND compact_empty_test)
+
+# 0-row DIFFERENTIAL cases (carry-forward (1) at the differential level): filter-
+# selects-nothing, global aggregate over empty input, keyed aggregate over empty,
+# empty ORDER BY, empty INNER join — each diffed vs the reference AND DuckDB (when
+# staged) through the PLAN path. CI pins QE_CI_SEED (D13).
+add_executable(oracle_zero_row_test
+  tests/wp1_test_main.cpp tests/oracle_zero_row_test.cpp)
+target_link_libraries(oracle_zero_row_test PRIVATE doctest qe_oracle)
+add_test(NAME oracle_zero_row_test
+  COMMAND oracle_zero_row_test --seed ${QE_CI_SEED})
+
+# THE MUTATION CATALOG META-TEST. The registry (tests/mutation_catalog.*) names
+# every must-flag mutant, its §12 hazard, and the test that catches it; the check
+# bodies live in conflict-free TUs (tests/catalog_checks_*.cpp — each includes at
+# most one of the three distinct qe::mutant::Mutation headers); the three new WP-9
+# mutants live in tests/catalog_mutants.cpp. The meta-test asserts >=6 entries,
+# every §12 hazard spanned, and — for EVERY entry — the un-mutated engine passes
+# and the mutant is flagged. Links qe_oracle (carries the real engine + DuckDB when
+# staged) PLUS every mutant library (their qe::mutant::Mutation enums never share a
+# TU, only the final link, where they do not interact). CI pins QE_CI_SEED.
+add_executable(mutation_catalog_meta_test
+  tests/wp1_test_main.cpp
+  tests/mutation_catalog_meta_test.cpp
+  tests/mutation_catalog.cpp
+  tests/catalog_checks_kernel.cpp
+  tests/catalog_checks_hash.cpp
+  tests/catalog_checks_join_sort.cpp
+  tests/catalog_checks_agg_plan.cpp
+  tests/catalog_mutants.cpp)
+target_link_libraries(mutation_catalog_meta_test PRIVATE
+  doctest
+  qe_oracle
+  qe_validity_mutants
+  qe_expr_mutants
+  qe_hashtable_mutants
+  qe_aggregate_mutants
+  qe_join_mutants
+  qe_sort_mutants
+  qe_plan_mutants)
+add_test(NAME mutation_catalog_meta_test
+  COMMAND mutation_catalog_meta_test --seed ${QE_CI_SEED})
+# Runs DuckDB over several queries when staged; generous wall-clock under sanitizers.
+set_tests_properties(mutation_catalog_meta_test PROPERTIES TIMEOUT 300)
