@@ -167,6 +167,74 @@ std::string render_join(const PlanNode& n, Ctx& ctx) {
     return os.str();
 }
 
+// WP-12 (additive): render an AsofJoin to DuckDB `ASOF [LEFT] JOIN`. The match is
+// the greatest build timestamp <= probe timestamp (the inequality `pa.t >= ba.t`),
+// among rows agreeing on the equality keys. Output columns are probe-then-build,
+// o-aliased by POSITION (same scheme as render_join), each CAST to its engine type.
+//
+// TOLERANCE (verified vs DuckDB v1.1.3): "nearest preceding, then drop if t - tb >
+// tol" (= pandas merge_asof window; nearest-then-check and nearest-within-window
+// coincide for a backward as-of). For INNER this is an EXTRA ON conjunct
+// `(pa.t - ba.t) <= tol` (which correctly drops out-of-window rows). For LEFT the
+// extra ON conjunct would WRONGLY drop the probe row, so we keep the plain ASOF
+// LEFT JOIN and NULL-MASK each build column with
+// `CASE WHEN (pa.t - ba.t) <= tol THEN ba.oj END` (probe row stays, build cols NULL
+// when out of window) — matching the engine's LEFT semantics exactly.
+std::string render_asof(const PlanNode& n, Ctx& ctx) {
+    const Plan& left = n.children[0];   // probe
+    const Plan& right = n.children[1];  // build
+    const std::string lsql = render(left, ctx);
+    const std::string rsql = render(right, ctx);
+    const Schema& ls = left.output_schema();
+    const Schema& rs = right.output_schema();
+    const std::string pa = ctx.next_alias();  // probe alias
+    const std::string ba = ctx.next_alias();  // build alias
+    const bool is_left = n.asof_type == tsx::AsofType::Left;
+
+    // The "(pa.tcol - ba.tcol) <= tol" window predicate (only when tolerance set).
+    std::ostringstream win;
+    if (n.asof_tolerance)
+        win << "(" << pa << ".o" << n.asof_left_time << " - " << ba << ".o"
+            << n.asof_right_time << ") <= " << *n.asof_tolerance;
+    const std::string window = win.str();
+    const bool mask_build = n.asof_tolerance && is_left;  // LEFT => CASE-mask
+
+    std::ostringstream os;
+    os << "SELECT ";
+    std::size_t o = 0;
+    for (std::size_t i = 0; i < ls.fields.size(); ++i) {
+        if (o) os << ", ";
+        os << "CAST(" << pa << ".o" << i << " AS " << sql_type(ls.fields[i].second)
+           << ") AS o" << o;
+        ++o;
+    }
+    for (std::size_t j = 0; j < rs.fields.size(); ++j) {
+        if (o) os << ", ";
+        os << "CAST(";
+        if (mask_build)
+            os << "CASE WHEN " << window << " THEN " << ba << ".o" << j << " END";
+        else
+            os << ba << ".o" << j;
+        os << " AS " << sql_type(rs.fields[j].second) << ") AS o" << o;
+        ++o;
+    }
+    os << " FROM (" << lsql << ") AS " << pa << " "
+       << (is_left ? "ASOF LEFT JOIN " : "ASOF JOIN ") << "(" << rsql << ") AS "
+       << ba << " ON ";
+    // ON conjuncts: equality keys, then the single backward inequality, then (for
+    // INNER + tolerance) the window as an extra conjunct.
+    bool first = true;
+    for (std::size_t i = 0; i < n.asof_left_keys.size(); ++i) {
+        os << (first ? "" : " AND ") << pa << ".o" << n.asof_left_keys[i] << " = "
+           << ba << ".o" << n.asof_right_keys[i];
+        first = false;
+    }
+    os << (first ? "" : " AND ") << pa << ".o" << n.asof_left_time
+       << " >= " << ba << ".o" << n.asof_right_time;
+    if (n.asof_tolerance && !is_left) os << " AND " << window;
+    return os.str();
+}
+
 std::string render_sort(const PlanNode& n, Ctx& ctx) {
     const Plan& child = n.children[0];
     const std::string csql = render(child, ctx);
@@ -186,6 +254,7 @@ std::string render(const Plan& p, Ctx& ctx) {
         case PlanKind::Aggregate: return render_aggregate(n, ctx);
         case PlanKind::Join: return render_join(n, ctx);
         case PlanKind::Sort: return render_sort(n, ctx);
+        case PlanKind::AsofJoin: return render_asof(n, ctx);
     }
     return "";  // unreachable
 }

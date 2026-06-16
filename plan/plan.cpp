@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "ops/filter.h"
+#include "tsx/asof.h"  // WP-12: lower AsofJoin to the tsx operator
 
 namespace qe::plan {
 namespace {
@@ -218,6 +219,20 @@ void print_node(const Plan& p, int depth, std::ostream& os) {
             os << "]";
             break;
         }
+        case PlanKind::AsofJoin: {
+            os << "AsofJoin "
+               << (n.asof_type == tsx::AsofType::Left ? "LEFT" : "INNER")
+               << " left_keys=[";
+            for (std::size_t i = 0; i < n.asof_left_keys.size(); ++i)
+                os << (i ? "," : "") << n.asof_left_keys[i];
+            os << "] right_keys=[";
+            for (std::size_t i = 0; i < n.asof_right_keys.size(); ++i)
+                os << (i ? "," : "") << n.asof_right_keys[i];
+            os << "] left_time=" << n.asof_left_time
+               << " right_time=" << n.asof_right_time << " (>=)";
+            if (n.asof_tolerance) os << " tol=" << *n.asof_tolerance;
+            break;
+        }
     }
     os << "\n";
     for (const Plan& c : n.children) print_node(c, depth + 1, os);
@@ -348,6 +363,58 @@ PlanBuilder PlanBuilder::join(const Plan& build, std::vector<ColRef> left_keys,
     return PlanBuilder(Plan(std::move(n)));
 }
 
+PlanBuilder PlanBuilder::asof_join(const Plan& build,
+                                   std::vector<ColRef> left_keys,
+                                   std::vector<ColRef> right_keys,
+                                   ColRef left_time, ColRef right_time,
+                                   tsx::AsofType type,
+                                   std::optional<std::int64_t> tolerance) const {
+    const Schema& ls = plan_.output_schema();
+    const Schema& rs = build.output_schema();
+    if (left_keys.size() != right_keys.size())
+        throw std::invalid_argument(
+            "plan: asof_join needs an equal number of left/right keys");
+    std::vector<std::uint32_t> lk, rk;
+    lk.reserve(left_keys.size());
+    rk.reserve(right_keys.size());
+    for (std::size_t i = 0; i < left_keys.size(); ++i) {
+        const std::uint32_t li = left_keys[i].resolve(ls);
+        const std::uint32_t ri = right_keys[i].resolve(rs);
+        if (ls.fields[li].second != rs.fields[ri].second)
+            throw std::invalid_argument(
+                "plan: asof_join key " + std::to_string(i) +
+                " type mismatch (left " + type_name(ls.fields[li].second) +
+                " vs right " + type_name(rs.fields[ri].second) + ")");
+        lk.push_back(li);
+        rk.push_back(ri);
+    }
+    const std::uint32_t lt = left_time.resolve(ls);
+    const std::uint32_t rt = right_time.resolve(rs);
+    auto is_time_type = [](Type t) {
+        return t == Type::TS || t == Type::I32 || t == Type::I64;
+    };
+    if (!is_time_type(ls.fields[lt].second) ||
+        !is_time_type(rs.fields[rt].second))
+        throw std::invalid_argument(
+            "plan: asof_join timestamp columns must be TS/I32/I64");
+    // Output = all probe (left) columns then all build (right) columns.
+    Schema out;
+    out.fields.reserve(ls.fields.size() + rs.fields.size());
+    for (const auto& f : ls.fields) out.fields.push_back(f);
+    for (const auto& f : rs.fields) out.fields.push_back(f);
+    auto n = make_node(PlanKind::AsofJoin);
+    n->children.push_back(plan_);  // [0] = probe / left
+    n->children.push_back(build);  // [1] = build / right
+    n->asof_left_keys = std::move(lk);
+    n->asof_right_keys = std::move(rk);
+    n->asof_left_time = lt;
+    n->asof_right_time = rt;
+    n->asof_type = type;
+    n->asof_tolerance = tolerance;
+    n->out_schema = std::move(out);
+    return PlanBuilder(Plan(std::move(n)));
+}
+
 PlanBuilder PlanBuilder::sort(std::vector<SortKey> keys) const {
     const Schema& cs = plan_.output_schema();
     if (keys.empty()) throw std::invalid_argument("plan: sort needs >=1 key");
@@ -394,6 +461,14 @@ std::unique_ptr<Operator> Plan::lower(std::size_t batch_size) const {
         case PlanKind::Sort:
             return std::make_unique<Sort>(n.children[0].lower(batch_size),
                                           n.sort_keys);
+        case PlanKind::AsofJoin:
+            // children[0] = probe/left, children[1] = build/right (same order as
+            // Join). The tsx operator sorts each side internally (frozen Sort).
+            return std::make_unique<tsx::AsofJoin>(
+                n.children[0].lower(batch_size),
+                n.children[1].lower(batch_size), n.asof_left_keys,
+                n.asof_right_keys, n.asof_left_time, n.asof_right_time,
+                n.asof_type, n.asof_tolerance);
     }
     throw std::logic_error("plan: unhandled PlanKind in lower()");
 }

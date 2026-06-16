@@ -14,10 +14,15 @@
 //  feeds the IDENTICAL comparator (oracle/result_set.h).
 #pragma once
 
+#include <cstdint>
+#include <optional>
+#include <vector>
+
 #include "oracle/logical_query.h"
 #include "oracle/result_set.h"
 #include "ops/table.h"
 #include "plan/plan.h"
+#include "tsx/asof.h"  // WP-12: AsofType
 
 namespace qe::oracle {
 
@@ -43,5 +48,24 @@ ResultSet run_plan_reference(const qe::plan::Plan& p);
 // engine's; output column order is probe columns then build columns.
 ResultSet run_join_reference(const Table& probe, const Table& build,
                              const JoinQuery& jq);
+
+// WP-12: the INDEPENDENT reference for a backward AS-OF join. For each probe row it
+// SCANS the whole build side (brute force) for rows with an equal, non-NULL key
+// tuple and a non-NULL timestamp tb <= the probe timestamp, picks the GREATEST such
+// tb (nearest preceding), and applies the optional tolerance (drop if t - tb >
+// tolerance). It shares NO code path with the engine's Sort / HashTable / merge /
+// gather, so "engine == reference" is a meaningful differential (alongside the
+// authoritative DuckDB ASOF JOIN diff). It reproduces the documented semantics
+// independently: a NULL in any key or in either timestamp never matches; F64 key
+// zero canonicalizes to +0.0 and NaN to a canonical quiet NaN; output column order
+// is probe columns then build columns; INNER drops unmatched probe rows, LEFT
+// NULL-fills them. (The generators keep build-side (key, timestamp) UNIQUE, so the
+// nearest-preceding pick is unambiguous — see the WP report.)
+ResultSet run_asof_reference(const Table& probe, const Table& build,
+                             const std::vector<std::uint32_t>& left_keys,
+                             const std::vector<std::uint32_t>& right_keys,
+                             std::uint32_t left_time, std::uint32_t right_time,
+                             qe::tsx::AsofType type,
+                             std::optional<std::int64_t> tolerance);
 
 }  // namespace qe::oracle

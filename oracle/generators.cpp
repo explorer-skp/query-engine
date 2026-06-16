@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -419,6 +421,180 @@ JoinCase gen_join_case(std::mt19937_64& rng) {
     q.type = (rng() % 2) == 0 ? JoinType::Inner : JoinType::Left;
 
     return JoinCase{std::move(probe), std::move(build), std::move(q)};
+}
+
+namespace {
+
+// A timestamp column type for the as-of ordering column (TS most often; also I64 /
+// I32 to exercise the integer-timestamp path the contract allows).
+Type rand_time_type(std::mt19937_64& rng) {
+    switch (rng() % 4) {
+        case 0: return Type::I32;
+        case 1: return Type::I64;
+        default: return Type::TS;  // bias toward TS (the headline type)
+    }
+}
+
+// Write timestamp `v` (int64) into time column `c` of type `t` at row `i`.
+void put_time(OwnedColumn& c, Type t, std::size_t i, std::int64_t v) {
+    std::byte* d = c.mutable_data();
+    switch (t) {
+        case Type::I32:
+            reinterpret_cast<std::int32_t*>(d)[i] = static_cast<std::int32_t>(v);
+            break;
+        case Type::I64:
+        case Type::TS:
+            reinterpret_cast<std::int64_t*>(d)[i] = v;
+            break;
+        case Type::F64:
+        case Type::BOOL:
+            break;  // not a timestamp type (unreachable for asof)
+    }
+}
+
+// `count` GLOBALLY DISTINCT timestamps within a bounded range (so build (key,ts) is
+// unique => deterministic nearest-preceding). Sampled without replacement, then
+// LEFT IN RANDOM ORDER (not pre-sorted) so the operator's own sort is exercised.
+std::vector<std::int64_t> distinct_timestamps(std::mt19937_64& rng,
+                                              std::size_t count,
+                                              std::int64_t lo, std::int64_t hi) {
+    std::vector<std::int64_t> out;
+    if (count == 0) return out;
+    std::set<std::int64_t> seen;
+    // Range is far larger than count, so rejection sampling terminates quickly.
+    while (out.size() < count) {
+        const std::int64_t v = rand_in(rng, lo, hi);
+        if (seen.insert(v).second) out.push_back(v);
+    }
+    return out;
+}
+
+}  // namespace
+
+AsofCase gen_asof_case(std::mt19937_64& rng) {
+    // 0 (global), 1 (single), or 2 (composite) partition keys.
+    const int nk = static_cast<int>(rng() % 3);
+    std::vector<Type> kt(static_cast<std::size_t>(nk));
+    for (int j = 0; j < nk; ++j) kt[static_cast<std::size_t>(j)] = rand_key_type(rng);
+    const Type ttype = rand_time_type(rng);
+    // Timestamp range: well within I32 magnitude so an I32 time column is safe; the
+    // window is far wider than the row counts, giving irregular gaps.
+    const std::int64_t TLO = -20000, THI = 20000;
+
+    const int D = 1 + static_cast<int>(rng() % 8);  // key cardinality 1..8
+    std::vector<std::vector<std::int64_t>> dom(
+        static_cast<std::size_t>(nk), std::vector<std::int64_t>(D));
+    for (int j = 0; j < nk; ++j)
+        for (int t = 0; t < D; ++t) dom[j][t] = rand_in(rng, 0, 99);
+
+    const int match_pct = 50 + static_cast<int>(rng() % 51);  // 50..100% in-domain
+    // NOTE: NULL keys and NULL timestamps are deliberately NOT generated. Two
+    // verified DuckDB v1.1.3 ASOF divergences make a byte-for-byte differential on
+    // them impossible or flaky, so — exactly like the div-by-zero / overflow
+    // divergences in this file — we CONSTRAIN GENERATION and validate the engine's
+    // own (principled "NULL never matches") semantics against the independent
+    // reference instead (see the asof_differential_test NULL edge cases):
+    //   (1) NULL TIMESTAMP: DuckDB matches a NULL probe timestamp to a NULL build
+    //       timestamp within a partition (NULL >= NULL treated as a self-equal
+    //       group); the engine takes the principled never-match path.
+    //   (2) NULL KEY: DuckDB's ASOF NULL-key matching is DATA-DEPENDENT — a probe
+    //       with a NULL key component matches a NULL-key build row when the full
+    //       table is present, but NOT when that probe row is queried in isolation
+    //       (a hash-partition artifact). There is no well-defined semantics to
+    //       mirror, so we exclude it. (A NULL key correctly never matches in a
+    //       regular hash join — WP-6 — which is NOT data-dependent.)
+    const int keynull_pct = 0;  // see note above (engine: NULL key never matches)
+    const std::size_t B = static_cast<std::size_t>(rng() % 251);  // build rows
+    const std::size_t P = static_cast<std::size_t>(rng() % 251);  // probe rows
+    const int npb = static_cast<int>(rng() % 3);  // 0..2 build payload cols
+    const int npp = static_cast<int>(rng() % 3);  // 0..2 probe payload cols
+
+    // Schemas: c0..c{nk-1} keys, c{nk} timestamp, then payloads.
+    Schema bs, ps;
+    for (int j = 0; j < nk; ++j)
+        bs.fields.emplace_back("c" + std::to_string(j), kt[static_cast<std::size_t>(j)]);
+    bs.fields.emplace_back("c" + std::to_string(nk), ttype);
+    for (int j = 0; j < nk; ++j)
+        ps.fields.emplace_back("c" + std::to_string(j), kt[static_cast<std::size_t>(j)]);
+    ps.fields.emplace_back("c" + std::to_string(nk), ttype);
+    std::vector<Type> bp(static_cast<std::size_t>(npb)), pp(static_cast<std::size_t>(npp));
+    for (int j = 0; j < npb; ++j) {
+        bp[static_cast<std::size_t>(j)] = rand_type(rng);
+        bs.fields.emplace_back("c" + std::to_string(nk + 1 + j), bp[static_cast<std::size_t>(j)]);
+    }
+    for (int j = 0; j < npp; ++j) {
+        pp[static_cast<std::size_t>(j)] = rand_type(rng);
+        ps.fields.emplace_back("c" + std::to_string(nk + 1 + j), pp[static_cast<std::size_t>(j)]);
+    }
+
+    // ---- BUILD side: keys from the domain; globally-distinct timestamps so
+    // (key, ts) is unique; a keynull/tsnull fraction nulls a key col / the ts. ----
+    std::vector<OwnedColumn> bkeys(static_cast<std::size_t>(nk));
+    for (int j = 0; j < nk; ++j) bkeys[static_cast<std::size_t>(j)] = OwnedColumn::make(kt[static_cast<std::size_t>(j)], B);
+    OwnedColumn btime = OwnedColumn::make(ttype, B);
+    const std::vector<std::int64_t> bts = distinct_timestamps(rng, B, TLO, THI);
+    for (std::size_t i = 0; i < B; ++i) {
+        const bool null_key =
+            keynull_pct > 0 && static_cast<int>(rng() % 100) < keynull_pct;
+        const int null_col = (null_key && nk > 0) ? static_cast<int>(rng() % nk) : -1;
+        const int t = static_cast<int>(rng() % static_cast<unsigned>(D));
+        for (int j = 0; j < nk; ++j) {
+            put_key(bkeys[static_cast<std::size_t>(j)], kt[static_cast<std::size_t>(j)], i, dom[static_cast<std::size_t>(j)][t]);
+            if (j == null_col) bkeys[static_cast<std::size_t>(j)].set_null(i);
+        }
+        put_time(btime, ttype, i, bts[i]);  // never NULL (see note above)
+    }
+    std::vector<OwnedColumn> bcols;
+    for (int j = 0; j < nk; ++j) bcols.push_back(std::move(bkeys[static_cast<std::size_t>(j)]));
+    bcols.push_back(std::move(btime));
+    for (int j = 0; j < npb; ++j) bcols.push_back(gen_column(rng, bp[static_cast<std::size_t>(j)], B, 15));
+    Table build(bs, std::move(bcols));
+
+    // ---- PROBE side: match_pct draw an in-domain key; timestamps are irregular
+    // and SOMETIMES exactly equal a build timestamp (head-on `>=` boundary test).
+    std::vector<OwnedColumn> pkeys(static_cast<std::size_t>(nk));
+    for (int j = 0; j < nk; ++j) pkeys[static_cast<std::size_t>(j)] = OwnedColumn::make(kt[static_cast<std::size_t>(j)], P);
+    OwnedColumn ptime = OwnedColumn::make(ttype, P);
+    for (std::size_t i = 0; i < P; ++i) {
+        const bool null_key =
+            keynull_pct > 0 && static_cast<int>(rng() % 100) < keynull_pct;
+        const bool in_domain = static_cast<int>(rng() % 100) < match_pct;
+        const int null_col = (null_key && nk > 0) ? static_cast<int>(rng() % nk) : -1;
+        const int t = static_cast<int>(rng() % static_cast<unsigned>(D));
+        for (int j = 0; j < nk; ++j) {
+            const std::int64_t v = in_domain ? dom[static_cast<std::size_t>(j)][t]
+                                             : rand_in(rng, 1000, 2000);
+            put_key(pkeys[static_cast<std::size_t>(j)], kt[static_cast<std::size_t>(j)], i, v);
+            if (j == null_col) pkeys[static_cast<std::size_t>(j)].set_null(i);
+        }
+        // ~1/3 of probe timestamps land EXACTLY on a build timestamp (boundary);
+        // the rest are free (gaps, before-all, after-all).
+        std::int64_t pv;
+        if (!bts.empty() && rng() % 3 == 0)
+            pv = bts[rng() % bts.size()];
+        else
+            pv = rand_in(rng, TLO - 5000, THI + 5000);
+        put_time(ptime, ttype, i, pv);  // never NULL (see note above)
+    }
+    std::vector<OwnedColumn> pcols;
+    for (int j = 0; j < nk; ++j) pcols.push_back(std::move(pkeys[static_cast<std::size_t>(j)]));
+    pcols.push_back(std::move(ptime));
+    for (int j = 0; j < npp; ++j) pcols.push_back(gen_column(rng, pp[static_cast<std::size_t>(j)], P, 15));
+    Table probe(ps, std::move(pcols));
+
+    AsofCase c{std::move(probe), std::move(build), {}, {}, 0, 0,
+               qe::tsx::AsofType::Inner, std::nullopt};
+    for (int j = 0; j < nk; ++j) {
+        c.left_keys.push_back(static_cast<std::uint32_t>(j));
+        c.right_keys.push_back(static_cast<std::uint32_t>(j));
+    }
+    c.left_time = static_cast<std::uint32_t>(nk);
+    c.right_time = static_cast<std::uint32_t>(nk);
+    c.type = (rng() % 2) == 0 ? qe::tsx::AsofType::Inner : qe::tsx::AsofType::Left;
+    // ~40% carry a tolerance window (a few timestamp units up to a wide span).
+    if (rng() % 5 < 2)
+        c.tolerance = static_cast<std::int64_t>(rng() % 8000);
+    return c;
 }
 
 PlanCase gen_plan_case(std::mt19937_64& rng) {

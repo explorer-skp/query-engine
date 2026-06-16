@@ -31,11 +31,14 @@ so "flagged"/"passes" is decided against DuckDB, not just the reference oracle.
 | 10 | `sort_desc_as_asc` | sort orchestration: DESC sorted ASC | `mutant::Sort{kDescSortsAsc}` | **positional** differential vs DuckDB (`sort_mutation_test`) |
 | 11 | `agg_fold_null_in_sum` | aggregation orchestration: NULL folded as 0 in SUM | `mutant::Aggregate{kFoldNullInSum}` | group-by differential vs DuckDB (`agg_mutation_test`) |
 | 12 | `plan_drop_sort` | plan-lowering orchestration: dropped Sort | `plan::lower_mutant{kDropSort}` | **positional** plan differential vs DuckDB (`plan_mutation_test`) |
+| 13 | `asof_boundary_strict` | as-of orchestration: `>`-vs-`>=` boundary (drops equal-timestamp matches) | `tsx::mutant::AsofJoin{kBoundaryStrict}` | as-of differential vs DuckDB `ASOF JOIN` (`asof_mutation_test`) |
 
 Entries 6–8 are the **new WP-9 mutants** (`tests/catalog_mutants.*`); entry 8 is
 the WP-2 carry-forward ("float→int round via +0.5"). Entries 1–5 and 9–12
 consolidate the per-WP mutants the earlier work packages shipped, each still also
-exercised by its own catching test (the right-hand column).
+exercised by its own catching test (the right-hand column). **Entry 13 is the
+WP-12 (Phase-2) as-of-join addition** (`tsx/asof_mutants.*`) — appended without
+touching the existing rows; it represents the §5 as-of boundary hazard.
 
 ## Carry-forward fix (regression, not a survivable mutant)
 
@@ -67,6 +70,8 @@ complete planted-mutant set each per-WP test drives:
   `kRadixSignBug`, `kUnstableTiebreak`, `kEmitTailOffByOne` — `sort_mutation_test`.
 - **plan** (`plan/plan_mutants.*`): `kDropFilter`, `kSwapJoinSides`,
   `kReverseAggKeys`, `kDropSort` — `plan_mutation_test`.
+- **as-of** (`tsx/asof_mutants.*`, WP-12): `kBoundaryStrict`, `kNearestFollowing`,
+  `kIgnoreLastKey`, `kLeftWrongNull` — `asof_mutation_test`.
 - **operator orchestration** (`tests/oracle_mutation_test.cpp`): inverted filter,
   dropped final partial batch.
 - **WP-9 new** (`tests/catalog_mutants.*`): `cast_f64_to_i64_plus_half`,

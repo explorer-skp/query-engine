@@ -207,13 +207,30 @@ set_source_files_properties(
   ops/agg_kernels.cpp
   PROPERTIES COMPILE_OPTIONS "-Wno-error")
 
+# --- WP-12: tsx Phase-2 operators (tsx/asof.h is WP-12's public surface) -------
+# qe_tsx is the time-series operator layer. The as-of join REUSES qe_ops (frozen
+# Sort + HashTable + the join_internal gather emitters + Table/expr) and pulls in NO
+# Highway directly and NOTHING from oracle/tests, so the from-scratch grep over tsx/
+# stays clean. Full -Wall -Wextra -Werror (no third-party headers).
+add_library(qe_tsx STATIC tsx/asof.cpp)
+target_link_libraries(qe_tsx PUBLIC qe_ops)
+
+# Test-only planted mutant of the as-of operator (boundary `<` / nearest-following /
+# ignore-a-key / wrong-LEFT-null). NOT linked into any engine target — only the
+# WP-12 mutation self-test (and the consolidated catalog meta-test). Reuses qe_ops'
+# shared join_internal emitters + frozen Sort/HashTable so it differs from the real
+# operator by exactly one merge/emit step.
+add_library(qe_asof_mutants STATIC tsx/asof_mutants.cpp)
+target_link_libraries(qe_asof_mutants PUBLIC qe_ops)
+
 # --- WP-8: physical plan nodes + dataframe builder API + lowering + print -----
 # qe_plan is the engine-side plan layer (plan/plan.h is WP-8's public surface).
 # It links qe_ops (Scan/Filter/Project/Aggregate/HashJoin/Sort + Table + expr) and
-# pulls in NO Highway directly and NOTHING from oracle/tests, so the from-scratch
-# grep over plan/ stays clean. Full -Wall -Wextra -Werror (no third-party headers).
+# qe_tsx (WP-12: AsofJoin lowering), pulls in NO Highway directly and NOTHING from
+# oracle/tests, so the from-scratch grep over plan/ stays clean. Full
+# -Wall -Wextra -Werror (no third-party headers).
 add_library(qe_plan STATIC plan/plan.cpp)
-target_link_libraries(qe_plan PUBLIC qe_ops)
+target_link_libraries(qe_plan PUBLIC qe_ops qe_tsx)
 
 # Test-only planted mutant LOWERING (drop filter / swap join sides / reverse agg
 # keys / drop sort). NOT linked into any engine target — only the WP-8 mutation
@@ -582,6 +599,35 @@ target_link_libraries(plan_mutation_test
 add_test(NAME plan_mutation_test
   COMMAND plan_mutation_test --seed ${QE_CI_SEED})
 
+# --- WP-12 tests: backward as-of join (Phase-2 headline). ---------------------
+# The differential: ONE Plan (scan.asof_join) drives both backends — it lowers to
+# tsx::AsofJoin and renders to DuckDB ASOF JOIN. Diffs green vs the independent
+# brute-force reference (always) and DuckDB (when staged). Links qe_oracle (carries
+# qe_plan -> qe_tsx, and DuckDB when staged). CI pins QE_CI_SEED (D13).
+add_executable(asof_differential_test
+  tests/wp1_test_main.cpp tests/asof_differential_test.cpp)
+target_link_libraries(asof_differential_test PRIVATE doctest qe_oracle)
+add_test(NAME asof_differential_test
+  COMMAND asof_differential_test --seed ${QE_CI_SEED})
+
+# scalar==vector end-to-end (the matched-row gather + the partition hash): force
+# each path on identical input and assert byte-identical output (rule 3 / D17).
+add_executable(asof_scalar_vector_test
+  tests/wp1_test_main.cpp tests/asof_scalar_vector_test.cpp)
+target_link_libraries(asof_scalar_vector_test PRIVATE doctest qe_oracle)
+add_test(NAME asof_scalar_vector_test
+  COMMAND asof_scalar_vector_test --seed ${QE_CI_SEED})
+
+# Mutation self-test: the differential MUST flag a broken as-of (strict boundary /
+# nearest-following / ignored partition key / wrong LEFT null), and pass on the real
+# operator. Links the planted-mutant library alongside qe_oracle.
+add_executable(asof_mutation_test
+  tests/wp1_test_main.cpp tests/asof_mutation_test.cpp)
+target_link_libraries(asof_mutation_test
+  PRIVATE doctest qe_oracle qe_asof_mutants)
+add_test(NAME asof_mutation_test
+  COMMAND asof_mutation_test --seed ${QE_CI_SEED})
+
 # ============================================================================
 # WP-10: benchmark harness (cross-cutting). Measures the finished Phase-1 engine
 # credibly — vec-vs-scalar per-operator ratios, engine-vs-DuckDB ratio, a roofline
@@ -680,6 +726,7 @@ add_executable(mutation_catalog_meta_test
   tests/catalog_checks_hash.cpp
   tests/catalog_checks_join_sort.cpp
   tests/catalog_checks_agg_plan.cpp
+  tests/catalog_checks_asof.cpp
   tests/catalog_mutants.cpp)
 target_link_libraries(mutation_catalog_meta_test PRIVATE
   doctest
@@ -690,7 +737,8 @@ target_link_libraries(mutation_catalog_meta_test PRIVATE
   qe_aggregate_mutants
   qe_join_mutants
   qe_sort_mutants
-  qe_plan_mutants)
+  qe_plan_mutants
+  qe_asof_mutants)
 add_test(NAME mutation_catalog_meta_test
   COMMAND mutation_catalog_meta_test --seed ${QE_CI_SEED})
 # Runs DuckDB over several queries when staged; generous wall-clock under sanitizers.

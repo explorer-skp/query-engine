@@ -74,6 +74,9 @@ std::vector<Entry> build_catalog() {
          ck::agg_fold_null_in_sum},
         {"plan_drop_sort", Hazard::kOperatorOrchestration,
          "plan::lower_mutant{kDropSort}", "plan_mutation_test", ck::plan_drop_sort},
+        {"asof_boundary_strict", Hazard::kOperatorOrchestration,
+         "tsx::mutant::AsofJoin{kBoundaryStrict}", "asof_mutation_test",
+         ck::asof_boundary_strict},
     };
 }
 

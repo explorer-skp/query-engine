@@ -29,4 +29,7 @@ Verdict sort_desc_as_asc();
 Verdict agg_fold_null_in_sum();
 Verdict plan_drop_sort();
 
+// as-of join (tests/catalog_checks_asof.cpp) — WP-12
+Verdict asof_boundary_strict();
+
 }  // namespace qe::catalog::checks

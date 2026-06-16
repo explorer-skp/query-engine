@@ -535,6 +535,122 @@ ResultSet run_join_reference(const Table& probe, const Table& build,
     return rs;
 }
 
+// ---- WP-12: backward as-of join reference ----------------------------------
+namespace {
+
+// A timestamp read as int64 (the comparison domain), independent of the engine:
+// I32 widened, I64/TS verbatim. valid==false for a NULL timestamp.
+struct RefTime {
+    bool valid = false;
+    std::int64_t t = 0;
+};
+RefTime read_time_ref(const Column& c, std::size_t r) {
+    RefTime out;
+    out.valid = c.all_valid || validity::get_bit(c.validity, r);
+    if (!out.valid) return out;
+    switch (c.type) {
+        case Type::I32:
+            out.t = reinterpret_cast<const std::int32_t*>(c.data)[r];
+            break;
+        case Type::I64:
+        case Type::TS:
+            out.t = reinterpret_cast<const std::int64_t*>(c.data)[r];
+            break;
+        case Type::F64:
+        case Type::BOOL:
+            out.valid = false;  // not a valid timestamp type
+            break;
+    }
+    return out;
+}
+
+}  // namespace
+
+ResultSet run_asof_reference(const Table& probe, const Table& build,
+                             const std::vector<std::uint32_t>& left_keys,
+                             const std::vector<std::uint32_t>& right_keys,
+                             std::uint32_t left_time, std::uint32_t right_time,
+                             qe::tsx::AsofType type,
+                             std::optional<std::int64_t> tolerance) {
+    Schema out = join_output_schema(probe.schema(), build.schema());
+    ResultSet rs;
+    for (const auto& f : out.fields) rs.types.push_back(f.second);
+
+    const Batch pb = probe.full_batch_view();
+    const Batch bb = build.full_batch_view();
+    const std::size_t np = probe.num_rows();
+    const std::size_t nb = build.num_rows();
+    const std::size_t nk = right_keys.size();
+
+    // Canonical key tuple of a row, or nullopt if ANY key column is NULL (a NULL
+    // key never matches — same canonicalization as group_by/join above).
+    using KeyTuple = std::vector<std::uint64_t>;
+    auto key_of = [&](const Batch& b, const std::vector<std::uint32_t>& keys,
+                      const Schema& sch,
+                      std::size_t r) -> std::optional<KeyTuple> {
+        KeyTuple kt;
+        kt.reserve(nk);
+        for (std::size_t j = 0; j < nk; ++j) {
+            const std::uint32_t kc = keys[j];
+            const auto [is_null, w] = key_word(b.cols[kc], r, sch.fields[kc].second);
+            if (is_null) return std::nullopt;
+            kt.push_back(w);
+        }
+        return kt;
+    };
+
+    auto emit_build_null = [&](std::vector<Cell>& row) {
+        for (std::size_t c = 0; c < build.schema().fields.size(); ++c) {
+            Cell cell;
+            cell.is_null = true;
+            row.push_back(cell);
+        }
+    };
+
+    for (std::size_t r = 0; r < np; ++r) {
+        std::vector<Cell> probe_cells;
+        probe_cells.reserve(probe.schema().fields.size());
+        for (std::size_t c = 0; c < probe.schema().fields.size(); ++c)
+            probe_cells.push_back(read_cell_col(pb.cols[c], r));
+
+        const auto pkey = key_of(pb, left_keys, probe.schema(), r);
+        const RefTime pt = read_time_ref(pb.cols[left_time], r);
+
+        // Brute-force scan for the nearest PRECEDING build row with an equal key.
+        bool have = false;
+        std::size_t best = 0;
+        std::int64_t best_ts = 0;
+        if (pkey && pt.valid) {
+            for (std::size_t s = 0; s < nb; ++s) {
+                const auto bkey = key_of(bb, right_keys, build.schema(), s);
+                if (!bkey || *bkey != *pkey) continue;
+                const RefTime bt = read_time_ref(bb.cols[right_time], s);
+                if (!bt.valid || bt.t > pt.t) continue;  // `<=` boundary
+                if (!have || bt.t > best_ts) {            // greatest tb <= t
+                    have = true;
+                    best = s;
+                    best_ts = bt.t;
+                }
+            }
+            if (have && tolerance && (pt.t - best_ts) > *tolerance)
+                have = false;  // nearest is outside the backward window
+        }
+
+        if (have) {
+            std::vector<Cell> row = probe_cells;
+            for (std::size_t c = 0; c < build.schema().fields.size(); ++c)
+                row.push_back(read_cell_col(bb.cols[c], best));
+            rs.rows.push_back(std::move(row));
+        } else if (type == qe::tsx::AsofType::Left) {
+            std::vector<Cell> row = probe_cells;
+            emit_build_null(row);
+            rs.rows.push_back(std::move(row));
+        }
+        // INNER + no match: emit nothing.
+    }
+    return rs;
+}
+
 // ---- WP-8: plan reference interpreter --------------------------------------
 namespace {
 
@@ -639,6 +755,15 @@ ResultSet eval_rs(const Plan& p) {
             q.projections = identity_projections(ct.schema());
             q.order_by = n.sort_keys;
             return run_reference(ct, q);
+        }
+        case PlanKind::AsofJoin: {  // WP-12 (additive arm)
+            const Plan& l = n.children[0];
+            const Plan& r = n.children[1];
+            const Table lt = rs_to_table(eval_rs(l), l.output_schema());
+            const Table rt = rs_to_table(eval_rs(r), r.output_schema());
+            return run_asof_reference(lt, rt, n.asof_left_keys, n.asof_right_keys,
+                                      n.asof_left_time, n.asof_right_time,
+                                      n.asof_type, n.asof_tolerance);
         }
     }
     return {};  // unreachable

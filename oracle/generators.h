@@ -22,13 +22,16 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <random>
 #include <vector>
 
 #include "oracle/logical_query.h"
 #include "ops/table.h"
 #include "plan/plan.h"
+#include "tsx/asof.h"  // WP-12: AsofType / AsofCase
 
 namespace qe::oracle {
 
@@ -49,6 +52,39 @@ struct JoinCase {
 // & skew (hot key), probe match rate, NULL-key fraction, row counts, payload
 // columns, and INNER vs LEFT.
 JoinCase gen_join_case(std::mt19937_64& rng);
+
+// WP-12: a generated backward AS-OF join case — two correlated tick-like Tables
+// plus the partition keys / timestamp columns / type / optional tolerance to run
+// over them. Layout (both sides): columns 0..nk-1 are the shared partition keys
+// (nk in 0..2 — global / single / composite), column nk is the TIMESTAMP (TS/I32/
+// I64), then 0..2 payload columns. The generator exercises the §5 hazards:
+//   * irregular timestamps with gaps (probe before any build row => no-match);
+//   * EXACT-timestamp ties at the boundary (some probe ts == a build ts, so the
+//     `>=` boundary is hit head-on);
+//   * single & composite & zero keys; INNER & LEFT; empty sides.
+// NULL KEYS and NULL TIMESTAMPS are deliberately NOT generated — two verified
+// DuckDB v1.1.3 ASOF divergences (a NULL probe ts matches a NULL build ts; NULL-key
+// matching is data-dependent) make a byte-for-byte diff impossible/flaky, so (per
+// the generators.h divergence philosophy) we constrain generation and validate the
+// engine's principled "NULL never matches" semantics against the independent
+// reference instead (see the asof_differential_test NULL edge cases + the .cpp note).
+// DETERMINISM: every build-side timestamp is GLOBALLY DISTINCT, so build (key,
+// timestamp) is unique and the nearest-preceding pick is unambiguous across engine
+// / reference / DuckDB (no flaky tie). The seed is printed by the harness for
+// replay. Tables live by value (the test wraps them in stable storage for the
+// plan's borrowing Scan nodes).
+struct AsofCase {
+    Table probe;
+    Table build;
+    std::vector<std::uint32_t> left_keys;
+    std::vector<std::uint32_t> right_keys;
+    std::uint32_t left_time = 0;
+    std::uint32_t right_time = 0;
+    qe::tsx::AsofType type = qe::tsx::AsofType::Inner;
+    std::optional<std::int64_t> tolerance;  // unset => unbounded
+};
+
+AsofCase gen_asof_case(std::mt19937_64& rng);
 
 
 // Magnitude bounds that keep all generated integer arithmetic overflow-free.

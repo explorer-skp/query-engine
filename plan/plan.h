@@ -38,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,13 +53,16 @@
 #include "ops/scan.h"       // Scan::kDefaultBatchSize
 #include "ops/sort.h"       // SortKey / SortDir / NullOrder
 #include "ops/table.h"      // Table
+#include "tsx/asof.h"       // WP-12: AsofType (additive Phase-2 plan extension)
 
 namespace qe::plan {
 
 // One node per frozen operator. The IR is intentionally 1:1 with ops/ so lowering
 // is a mechanical, defect-free transcription (and a deviation is a mutation the
 // oracle catches — see plan/plan_mutants.h).
-enum class PlanKind { Scan, Filter, Project, Aggregate, Join, Sort };
+// WP-12 (additive): AsofJoin is APPENDED — the existing six enumerators keep their
+// values/order byte-unchanged (verified at audit via `git diff`).
+enum class PlanKind { Scan, Filter, Project, Aggregate, Join, Sort, AsofJoin };
 
 // A column reference for KEY LISTS (group/join/sort keys): EITHER a physical
 // index into the child's output schema OR a name resolved against that schema at
@@ -109,6 +113,17 @@ struct PlanNode {
     std::vector<std::uint32_t> right_keys;   // Join build keys
     JoinType join_type = JoinType::Inner;    // Join
     std::vector<SortKey> sort_keys;          // Sort
+
+    // WP-12 (additive): AsofJoin fields. Independent of the Join fields above so
+    // every existing field stays byte-unchanged. left/right partition-equality keys
+    // (child-output indices), the single timestamp column per side, INNER/LEFT, and
+    // an optional backward tolerance window (unset => unbounded).
+    std::vector<std::uint32_t> asof_left_keys;    // AsofJoin probe equality keys
+    std::vector<std::uint32_t> asof_right_keys;   // AsofJoin build equality keys
+    std::uint32_t asof_left_time = 0;             // AsofJoin probe timestamp col
+    std::uint32_t asof_right_time = 0;            // AsofJoin build timestamp col
+    tsx::AsofType asof_type = tsx::AsofType::Inner;
+    std::optional<std::int64_t> asof_tolerance;   // unset => unbounded
 };
 
 // An immutable, shared, value-semantics handle to a PlanNode (mirrors expr::Expr).
@@ -165,6 +180,19 @@ class PlanBuilder {
                      std::vector<ColRef> right_keys, JoinType type) const;
     PlanBuilder sort(std::vector<SortKey> keys) const;   // index path (frozen)
     PlanBuilder sort(std::vector<SortBy> keys) const;    // name-friendly path
+
+    // WP-12 (additive): backward AS-OF join. `this` is the probe (left) side,
+    // `build` the build (right) side. `left_keys`/`right_keys` are the equality
+    // partition keys (equal length, possibly empty), `left_time`/`right_time` the
+    // single ordering (timestamp) column per side. `type` selects INNER vs LEFT;
+    // `tolerance` (optional) bounds the backward window (t - tb <= tolerance, in the
+    // timestamp column's integer units). Output columns are all left columns then
+    // all right columns (tsx/asof.h order, same as join()).
+    PlanBuilder asof_join(const Plan& build, std::vector<ColRef> left_keys,
+                          std::vector<ColRef> right_keys, ColRef left_time,
+                          ColRef right_time, tsx::AsofType type,
+                          std::optional<std::int64_t> tolerance =
+                              std::nullopt) const;
 
     // The assembled plan (the single source of truth feeding engine + oracle).
     const Plan& plan() const { return plan_; }
