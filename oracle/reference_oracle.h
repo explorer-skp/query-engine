@@ -22,7 +22,8 @@
 #include "oracle/result_set.h"
 #include "ops/table.h"
 #include "plan/plan.h"
-#include "tsx/asof.h"  // WP-12: AsofType
+#include "tsx/asof.h"    // WP-12: AsofType
+#include "tsx/window.h"  // WP-13: WindowMode
 
 namespace qe::oracle {
 
@@ -67,5 +68,22 @@ ResultSet run_asof_reference(const Table& probe, const Table& build,
                              std::uint32_t left_time, std::uint32_t right_time,
                              qe::tsx::AsofType type,
                              std::optional<std::int64_t> tolerance);
+
+// WP-13: the INDEPENDENT reference for windowed / time-bucketed aggregation. It
+// shares NO code path with the engine's Window operator / Sort / HashTable / gather /
+// ring-buffer — it recomputes the result DIRECTLY with std::library logic (a
+// std::map keyed by the canonical (keys…, bucket) tuple for tumbling; a brute-force
+// per-row frame scan over each partition's time-ordered rows for sliding), so
+// "engine == reference" is a meaningful differential (alongside the authoritative
+// DuckDB window/time-bucket diff). It reproduces the documented semantics
+// independently: NULL partition keys group together (kEqual); the bucket lower edge
+// is (t / W) * W; the sliding frame is ROWS BETWEEN P PRECEDING AND CURRENT ROW over
+// the partition's time-ascending order; SUM/MIN/MAX/AVG ignore NULLs (NULL on an
+// empty/all-null frame), COUNT(*) counts frame rows, COUNT(col) counts non-null. The
+// generators keep timestamps >= 0 (tumbling) and per-partition distinct (sliding).
+ResultSet run_window_reference(const Table& input, qe::tsx::WindowMode mode,
+                               const std::vector<std::uint32_t>& keys,
+                               std::uint32_t time, std::int64_t param,
+                               const std::vector<AggSpec>& aggs);
 
 }  // namespace qe::oracle

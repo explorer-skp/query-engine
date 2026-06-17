@@ -9,7 +9,8 @@
 #include <utility>
 
 #include "ops/filter.h"
-#include "tsx/asof.h"  // WP-12: lower AsofJoin to the tsx operator
+#include "tsx/asof.h"    // WP-12: lower AsofJoin to the tsx operator
+#include "tsx/window.h"  // WP-13: lower Window to the tsx operator
 
 namespace qe::plan {
 namespace {
@@ -233,6 +234,31 @@ void print_node(const Plan& p, int depth, std::ostream& os) {
             if (n.asof_tolerance) os << " tol=" << *n.asof_tolerance;
             break;
         }
+        case PlanKind::Window: {
+            const Schema& cs = n.children[0].output_schema();
+            os << "Window "
+               << (n.window_mode == tsx::WindowMode::Tumbling ? "TUMBLING"
+                                                              : "SLIDING")
+               << " keys=[";
+            for (std::size_t i = 0; i < n.window_keys.size(); ++i)
+                os << (i ? "," : "") << cs.fields[n.window_keys[i]].first;
+            os << "] time=" << cs.fields[n.window_time].first
+               << (n.window_mode == tsx::WindowMode::Tumbling ? " width=" : " P=")
+               << n.window_param << " aggs=[";
+            for (std::size_t i = 0; i < n.window_aggs.size(); ++i) {
+                if (i) os << ", ";
+                const AggSpec& a = n.window_aggs[i];
+                os << agg_name(a.func);
+                if (a.func != AggFunc::CountStar)
+                    os << "(" << cs.fields[a.input_col].first << ")";
+                os << " AS " << a.out_name;
+            }
+            os << "]";
+            break;
+        }
+        case PlanKind::CompressedScan:  // WP-14 (additive)
+            os << "CompressedScan " << schema_str(n.ctable->schema());
+            break;
     }
     os << "\n";
     for (const Plan& c : n.children) print_node(c, depth + 1, os);
@@ -261,6 +287,19 @@ PlanBuilder scan(const Table& table) {
     auto n = make_node(PlanKind::Scan);
     n->table = &table;
     n->out_schema = table.schema();
+    return PlanBuilder(Plan(std::move(n)));
+}
+
+// WP-14 (additive): compressed-scan leaf. The node's out_schema is the compressed
+// table's schema (decoding preserves it). `ctable` is the engine source (lowering
+// decodes from it ONLY); `reference` is the independent source the oracle loads
+// (never the engine's decode output — the non-circularity contract). No execution.
+PlanBuilder compressed_scan(const tsx::CompressedTable& ct,
+                            const Table& reference) {
+    auto n = make_node(PlanKind::CompressedScan);
+    n->ctable = &ct;
+    n->ctable_ref = &reference;
+    n->out_schema = ct.schema();
     return PlanBuilder(Plan(std::move(n)));
 }
 
@@ -415,6 +454,96 @@ PlanBuilder PlanBuilder::asof_join(const Plan& build,
     return PlanBuilder(Plan(std::move(n)));
 }
 
+// WP-13 (additive): windowed / time-bucketed aggregation builders. Shared helper to
+// validate the timestamp column type and the aggregate columns + append the agg
+// result columns to an output schema.
+namespace {
+
+bool is_time_type(Type t) {
+    return t == Type::TS || t == Type::I32 || t == Type::I64;
+}
+
+void append_agg_schema(Schema& out, const std::vector<AggSpec>& aggs,
+                       const Schema& cs) {
+    for (const AggSpec& a : aggs) {
+        Type in = Type::I64;
+        if (a.func != AggFunc::CountStar) {
+            require_index(a.input_col, cs, "window aggregate input column");
+            in = cs.fields[a.input_col].second;
+        }
+        out.fields.emplace_back(a.out_name, agg_result_type(a.func, in));
+    }
+}
+
+}  // namespace
+
+PlanBuilder PlanBuilder::window_tumbling(std::vector<ColRef> keys, ColRef time,
+                                         std::int64_t width,
+                                         std::vector<AggSpec> aggs) const {
+    const Schema& cs = plan_.output_schema();
+    if (aggs.empty())
+        throw std::invalid_argument("plan: window_tumbling needs >=1 aggregate");
+    if (width <= 0)
+        throw std::invalid_argument("plan: window_tumbling width must be > 0");
+    std::vector<std::uint32_t> key_idx;
+    key_idx.reserve(keys.size());
+    Schema out;
+    for (const ColRef& k : keys) {
+        const std::uint32_t i = k.resolve(cs);
+        key_idx.push_back(i);
+        out.fields.emplace_back(cs.fields[i].first, cs.fields[i].second);
+    }
+    const std::uint32_t t = time.resolve(cs);
+    if (!is_time_type(cs.fields[t].second))
+        throw std::invalid_argument(
+            "plan: window_tumbling timestamp column must be TS/I32/I64");
+    // The bucket lower edge carries the timestamp column's type and name.
+    out.fields.emplace_back(cs.fields[t].first, cs.fields[t].second);
+    append_agg_schema(out, aggs, cs);
+
+    auto n = make_node(PlanKind::Window);
+    n->children.push_back(plan_);
+    n->window_mode = tsx::WindowMode::Tumbling;
+    n->window_keys = std::move(key_idx);
+    n->window_time = t;
+    n->window_param = width;
+    n->window_aggs = std::move(aggs);
+    n->out_schema = std::move(out);
+    return PlanBuilder(Plan(std::move(n)));
+}
+
+PlanBuilder PlanBuilder::window_sliding(std::vector<ColRef> keys, ColRef time,
+                                        std::int64_t preceding,
+                                        std::vector<AggSpec> aggs) const {
+    const Schema& cs = plan_.output_schema();
+    if (aggs.empty())
+        throw std::invalid_argument("plan: window_sliding needs >=1 aggregate");
+    if (preceding < 0)
+        throw std::invalid_argument("plan: window_sliding preceding must be >= 0");
+    std::vector<std::uint32_t> key_idx;
+    key_idx.reserve(keys.size());
+    for (const ColRef& k : keys) key_idx.push_back(k.resolve(cs));
+    const std::uint32_t t = time.resolve(cs);
+    if (!is_time_type(cs.fields[t].second))
+        throw std::invalid_argument(
+            "plan: window_sliding timestamp column must be TS/I32/I64");
+    // Output = all child columns in order, then the running-aggregate columns.
+    Schema out;
+    out.fields.reserve(cs.fields.size() + aggs.size());
+    for (const auto& f : cs.fields) out.fields.push_back(f);
+    append_agg_schema(out, aggs, cs);
+
+    auto n = make_node(PlanKind::Window);
+    n->children.push_back(plan_);
+    n->window_mode = tsx::WindowMode::Sliding;
+    n->window_keys = std::move(key_idx);
+    n->window_time = t;
+    n->window_param = preceding;
+    n->window_aggs = std::move(aggs);
+    n->out_schema = std::move(out);
+    return PlanBuilder(Plan(std::move(n)));
+}
+
 PlanBuilder PlanBuilder::sort(std::vector<SortKey> keys) const {
     const Schema& cs = plan_.output_schema();
     if (keys.empty()) throw std::invalid_argument("plan: sort needs >=1 key");
@@ -469,6 +598,17 @@ std::unique_ptr<Operator> Plan::lower(std::size_t batch_size) const {
                 n.children[1].lower(batch_size), n.asof_left_keys,
                 n.asof_right_keys, n.asof_left_time, n.asof_right_time,
                 n.asof_type, n.asof_tolerance);
+        case PlanKind::Window:
+            // WP-13: lower to the tsx Window operator (it sorts/groups internally
+            // via the frozen Sort/HashTable). Same single child as Aggregate/Sort.
+            return std::make_unique<tsx::Window>(
+                n.children[0].lower(batch_size), n.window_mode, n.window_keys,
+                n.window_time, n.window_param, n.window_aggs);
+        case PlanKind::CompressedScan:
+            // WP-14: lower to the tsx CompressedScan over the ENGINE source `ctable`
+            // ONLY — it decodes the compressed bytes independently (the oracle path
+            // never touches `ctable`; the reference path reads `ctable_ref`).
+            return std::make_unique<tsx::CompressedScan>(*n.ctable, batch_size);
     }
     throw std::logic_error("plan: unhandled PlanKind in lower()");
 }

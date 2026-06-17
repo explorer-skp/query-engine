@@ -32,4 +32,10 @@ Verdict plan_drop_sort();
 // as-of join (tests/catalog_checks_asof.cpp) — WP-12
 Verdict asof_boundary_strict();
 
+// windowed aggregation (tests/catalog_checks_window.cpp) — WP-13
+Verdict window_frame_off_by_one();
+
+// compressed scan (tests/catalog_checks_compress.cpp) — WP-14
+Verdict compress_decode_drift();
+
 }  // namespace qe::catalog::checks

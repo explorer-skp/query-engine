@@ -77,6 +77,12 @@ std::vector<Entry> build_catalog() {
         {"asof_boundary_strict", Hazard::kOperatorOrchestration,
          "tsx::mutant::AsofJoin{kBoundaryStrict}", "asof_mutation_test",
          ck::asof_boundary_strict},
+        {"window_frame_off_by_one", Hazard::kOperatorOrchestration,
+         "tsx::mutant::Window{kFrameOffByOne}", "window_mutation_test",
+         ck::window_frame_off_by_one},
+        {"compress_decode_drift", Hazard::kOperatorOrchestration,
+         "tsx::mutant::CompressedScan{kDropSecondDerivative}",
+         "compress_mutation_test", ck::compress_decode_drift},
     };
 }
 

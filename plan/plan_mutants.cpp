@@ -13,6 +13,8 @@
 #include "ops/project.h"
 #include "ops/sort.h"
 #include "tsx/asof.h"  // WP-12: faithful AsofJoin lowering (no planted defect here)
+#include "tsx/compress.h"  // WP-14: faithful CompressedScan lowering (no defect here)
+#include "tsx/window.h"  // WP-13: faithful Window lowering (no planted defect here)
 
 namespace qe::plan {
 
@@ -62,6 +64,20 @@ std::unique_ptr<Operator> lower_mutant(const Plan& p, LowerMutation m,
                 lower_mutant(n.children[1], m, bs), n.asof_left_keys,
                 n.asof_right_keys, n.asof_left_time, n.asof_right_time,
                 n.asof_type, n.asof_tolerance);
+        case PlanKind::Window:
+            // WP-13 (additive arm): no lowering mutation is catalogued for the
+            // window operator (its planted defects live in tsx/window_mutants.*);
+            // lower faithfully so a Window node nested in a mutated plan still
+            // computes correctly.
+            return std::make_unique<tsx::Window>(
+                lower_mutant(n.children[0], m, bs), n.window_mode, n.window_keys,
+                n.window_time, n.window_param, n.window_aggs);
+        case PlanKind::CompressedScan:
+            // WP-14 (additive arm): no lowering mutation is catalogued for the
+            // compressed scan (its planted decode defects live in
+            // tsx/compress_mutants.*); lower faithfully so a CompressedScan leaf
+            // nested in a mutated plan still decodes from `ctable` correctly.
+            return std::make_unique<tsx::CompressedScan>(*n.ctable, bs);
     }
     throw std::logic_error("lower_mutant: unhandled PlanKind");
 }

@@ -212,8 +212,23 @@ set_source_files_properties(
 # Sort + HashTable + the join_internal gather emitters + Table/expr) and pulls in NO
 # Highway directly and NOTHING from oracle/tests, so the from-scratch grep over tsx/
 # stays clean. Full -Wall -Wextra -Werror (no third-party headers).
-add_library(qe_tsx STATIC tsx/asof.cpp)
+# WP-13 (additive) appends tsx/window.cpp to this existing source list (a sibling WP
+# also appends a source here — additive, the final review reconciles).
+# WP-14 (additive) also appends the time-series codecs + compressed scan here. The
+# from-scratch codecs (Gorilla / delta-of-delta / zig-zag / varint) live in
+# tsx/compress.cpp; the lone vectorized decode step (zig-zag) is the Highway TU
+# tsx/compress_kernels.cpp with its independently-written scalar twin
+# tsx/compress_scalar.cpp (rule 3 / D17). Only the Highway TU opts out of -Werror.
+add_library(qe_tsx STATIC
+  tsx/asof.cpp
+  tsx/window.cpp
+  tsx/compress.cpp
+  tsx/compress_kernels.cpp
+  tsx/compress_scalar.cpp)
 target_link_libraries(qe_tsx PUBLIC qe_ops)
+set_source_files_properties(
+  tsx/compress_kernels.cpp
+  PROPERTIES COMPILE_OPTIONS "-Wno-error")
 
 # Test-only planted mutant of the as-of operator (boundary `<` / nearest-following /
 # ignore-a-key / wrong-LEFT-null). NOT linked into any engine target — only the
@@ -222,6 +237,21 @@ target_link_libraries(qe_tsx PUBLIC qe_ops)
 # operator by exactly one merge/emit step.
 add_library(qe_asof_mutants STATIC tsx/asof_mutants.cpp)
 target_link_libraries(qe_asof_mutants PUBLIC qe_ops)
+
+# WP-13: test-only planted mutant of the Window operator (tumbling bucket-edge off by
+# one / sliding frame P+1). Its own library (no collision with the sibling). NOT
+# linked into any engine target — only the WP-13 mutation self-test + the catalog
+# meta-test. Reuses qe_ops' shared join_internal gather + agg_internal finalizer +
+# frozen Sort/HashTable, so it differs from the real operator by exactly one step.
+add_library(qe_window_mutants STATIC tsx/window_mutants.cpp)
+target_link_libraries(qe_window_mutants PUBLIC qe_ops)
+
+# WP-14 test-only planted mutant of the compressed scan (drop-second-derivative /
+# Gorilla-leading-zeros-off). NOT linked into any engine target — only the WP-14
+# mutation self-test + the catalog meta-test. Reuses qe_tsx's CompressedTable format
+# and zig-zag kernel so it differs from the real decoder by exactly one decode step.
+add_library(qe_compress_mutants STATIC tsx/compress_mutants.cpp)
+target_link_libraries(qe_compress_mutants PUBLIC qe_tsx)
 
 # --- WP-8: physical plan nodes + dataframe builder API + lowering + print -----
 # qe_plan is the engine-side plan layer (plan/plan.h is WP-8's public surface).
@@ -628,6 +658,80 @@ target_link_libraries(asof_mutation_test
 add_test(NAME asof_mutation_test
   COMMAND asof_mutation_test --seed ${QE_CI_SEED})
 
+# --- WP-13 tests: windowed / time-bucketed aggregation. -----------------------
+# The differential: ONE Plan (scan.window_tumbling / .window_sliding) drives both
+# backends — it lowers to tsx::Window and renders to DuckDB (GROUP BY time bucket /
+# window function). Diffs green vs the independent reference (always) and DuckDB
+# (when staged). Links qe_oracle (carries qe_plan -> qe_tsx, and DuckDB when staged).
+add_executable(window_differential_test
+  tests/wp1_test_main.cpp tests/window_differential_test.cpp)
+target_link_libraries(window_differential_test PRIVATE doctest qe_oracle)
+add_test(NAME window_differential_test
+  COMMAND window_differential_test --seed ${QE_CI_SEED})
+
+# scalar==vector end-to-end (the sliding child-column gather + the tumbling partition
+# hash): force each path on identical input and assert byte-identical output.
+add_executable(window_scalar_vector_test
+  tests/wp1_test_main.cpp tests/window_scalar_vector_test.cpp)
+target_link_libraries(window_scalar_vector_test PRIVATE doctest qe_oracle)
+add_test(NAME window_scalar_vector_test
+  COMMAND window_scalar_vector_test --seed ${QE_CI_SEED})
+
+# Mutation self-test: the differential MUST flag a broken window (tumbling bucket
+# edge off by one / sliding frame P+1) and pass on the real operator. Links the
+# planted-mutant library alongside qe_oracle.
+add_executable(window_mutation_test
+  tests/wp1_test_main.cpp tests/window_mutation_test.cpp)
+target_link_libraries(window_mutation_test
+  PRIVATE doctest qe_oracle qe_window_mutants)
+add_test(NAME window_mutation_test
+  COMMAND window_mutation_test --seed ${QE_CI_SEED})
+
+# --- WP-14 tests: time-series compression + compressed scan (Phase-2). --------
+# Pure engine-only round-trip: decode(encode(col)) is BIT-EXACT across the full
+# float domain (NaN payloads / ±0.0 / ±inf / subnormals) + interleaved nulls, per
+# type. No DuckDB. CI pins QE_CI_SEED (D13).
+add_executable(compress_roundtrip_test
+  tests/wp1_test_main.cpp tests/compress_roundtrip_test.cpp)
+target_link_libraries(compress_roundtrip_test PRIVATE doctest qe_tsx)
+add_test(NAME compress_roundtrip_test
+  COMMAND compress_roundtrip_test --seed ${QE_CI_SEED})
+
+# Compressed-scan differential: ONE Plan (compressed_scan, also + filter/project)
+# drives both backends — it lowers to tsx::CompressedScan (decoding the compressed
+# bytes) and renders to DuckDB SQL over the INDEPENDENT decompressed reference. Diffs
+# green vs the reference (always) and DuckDB (when staged), sweeping batch sizes.
+add_executable(compress_differential_test
+  tests/wp1_test_main.cpp tests/compress_differential_test.cpp)
+target_link_libraries(compress_differential_test PRIVATE doctest qe_oracle)
+add_test(NAME compress_differential_test
+  COMMAND compress_differential_test --seed ${QE_CI_SEED})
+# Heaviest WP-14 test: per-case DuckDB CREATE+INSERT+SELECT under sanitizers. Generous
+# wall-clock so a slow staged-DuckDB run never spuriously times out.
+set_tests_properties(compress_differential_test PROPERTIES TIMEOUT 600)
+
+# scalar==vector end-to-end for the zig-zag-decode kernel: force each DecodePath on
+# identical compressed input and assert byte-identical decoded output (rule 3 / D17).
+add_executable(compress_scalar_vector_test
+  tests/wp1_test_main.cpp tests/compress_scalar_vector_test.cpp)
+target_link_libraries(compress_scalar_vector_test PRIVATE doctest qe_tsx qe_oracle)
+add_test(NAME compress_scalar_vector_test
+  COMMAND compress_scalar_vector_test --seed ${QE_CI_SEED})
+
+# Mutation self-test: the round-trip / compressed-scan diff MUST flag a broken decode
+# (drop-second-derivative / Gorilla-leading-zeros-off), and pass on the real decoder.
+add_executable(compress_mutation_test
+  tests/wp1_test_main.cpp tests/compress_mutation_test.cpp)
+target_link_libraries(compress_mutation_test
+  PRIVATE doctest qe_oracle qe_compress_mutants)
+add_test(NAME compress_mutation_test
+  COMMAND compress_mutation_test --seed ${QE_CI_SEED})
+
+# WP-14 ratio + decode-throughput reporting driver (the §5 "reported" numbers).
+# Mac/NEON numbers are preliminary / relative-only (§2). Links qe_tsx + bench_infra.
+add_executable(bench_compress bench/bench_compress_main.cpp)
+target_link_libraries(bench_compress PRIVATE qe_tsx bench_infra hwy_target_probe)
+
 # ============================================================================
 # WP-10: benchmark harness (cross-cutting). Measures the finished Phase-1 engine
 # credibly — vec-vs-scalar per-operator ratios, engine-vs-DuckDB ratio, a roofline
@@ -727,6 +831,8 @@ add_executable(mutation_catalog_meta_test
   tests/catalog_checks_join_sort.cpp
   tests/catalog_checks_agg_plan.cpp
   tests/catalog_checks_asof.cpp
+  tests/catalog_checks_window.cpp
+  tests/catalog_checks_compress.cpp
   tests/catalog_mutants.cpp)
 target_link_libraries(mutation_catalog_meta_test PRIVATE
   doctest
@@ -738,7 +844,9 @@ target_link_libraries(mutation_catalog_meta_test PRIVATE
   qe_join_mutants
   qe_sort_mutants
   qe_plan_mutants
-  qe_asof_mutants)
+  qe_asof_mutants
+  qe_window_mutants
+  qe_compress_mutants)
 add_test(NAME mutation_catalog_meta_test
   COMMAND mutation_catalog_meta_test --seed ${QE_CI_SEED})
 # Runs DuckDB over several queries when staged; generous wall-clock under sanitizers.

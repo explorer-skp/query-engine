@@ -31,7 +31,8 @@
 #include "oracle/logical_query.h"
 #include "ops/table.h"
 #include "plan/plan.h"
-#include "tsx/asof.h"  // WP-12: AsofType / AsofCase
+#include "tsx/asof.h"    // WP-12: AsofType / AsofCase
+#include "tsx/window.h"  // WP-13: WindowMode / WindowCase
 
 namespace qe::oracle {
 
@@ -85,6 +86,32 @@ struct AsofCase {
 };
 
 AsofCase gen_asof_case(std::mt19937_64& rng);
+
+// WP-13: a generated windowed-aggregation case — one tick-like Table plus the
+// window mode / partition keys / timestamp column / param (bucket width W for
+// Tumbling, PRECEDING row count P for Sliding) / aggregate subset to run over it.
+// Layout: columns 0..nk-1 are the shared partition keys (nk in 0..2 — global /
+// single / composite), column nk is the TIMESTAMP (TS/I32/I64), then 0..2 payload
+// columns. The generator exercises the §5 hazards: occupied/empty buckets, single &
+// composite & zero keys, frames spanning batch boundaries incl. a tail, empty input,
+// all-null frame slices, and NULL partition keys (kEqual: group together). The
+// aggregate subset is overflow-safe (per-bucket / per-frame SUM provably within the
+// I64 accumulator). DETERMINISM / the two GENERATION CONSTRAINTS: every timestamp is
+// >= 0 (Tumbling: integer bucketing is divergence-free vs DuckDB) AND globally
+// distinct (Sliding: the window's ORDER BY t is a TOTAL order per partition, so every
+// running value is deterministic). Timestamps are never NULL. The seed is printed by
+// the harness for replay. The Table lives by value (the test wraps it in stable
+// storage for the plan's borrowing Scan node).
+struct WindowCase {
+    Table input;
+    qe::tsx::WindowMode mode = qe::tsx::WindowMode::Tumbling;
+    std::vector<std::uint32_t> keys;
+    std::uint32_t time = 0;
+    std::int64_t param = 1;  // W (tumbling) / P (sliding)
+    std::vector<AggSpec> aggs;
+};
+
+WindowCase gen_window_case(std::mt19937_64& rng);
 
 
 // Magnitude bounds that keep all generated integer arithmetic overflow-free.

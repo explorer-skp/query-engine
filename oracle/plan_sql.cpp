@@ -235,6 +235,90 @@ std::string render_asof(const PlanNode& n, Ctx& ctx) {
     return os.str();
 }
 
+// WP-13 (additive): render a Window node to DuckDB.
+//  * TUMBLING => a GROUP BY over the partition keys and the integer time bucket. The
+//    bucket lower edge is `(o_t - (o_t % W))` — integer `t - (t % W)` is EXACT
+//    bucketing for t >= 0, W > 0 (the generators keep timestamps >= 0), and avoids
+//    FLOOR/double drift. Output columns are the keys, then the bucket (CAST to the
+//    timestamp type), then each aggregate (CAST to its agg_result_type) — o-aliased
+//    by POSITION, the same scheme as render_aggregate.
+//  * SLIDING => one row per input row: the child columns pass through, then each
+//    aggregate as a WINDOW function `<agg> OVER (PARTITION BY <keys> ORDER BY o_t
+//    ROWS BETWEEN P PRECEDING AND CURRENT ROW)`, CAST to its agg_result_type.
+//    COUNT(*) renders as `COUNT(*) OVER (…)`. With zero partition keys the PARTITION
+//    BY clause is omitted (a single global window).
+std::string render_window(const PlanNode& n, Ctx& ctx) {
+    const Plan& child = n.children[0];
+    const std::string csql = render(child, ctx);
+    const Schema cos = o_schema(child.output_schema());
+    const std::string alias = ctx.next_alias();
+
+    // The bucket / order column is the child's o<window_time> column.
+    const std::string ot = "o" + std::to_string(n.window_time);
+    const Type ttype = cos.fields[n.window_time].second;
+
+    std::ostringstream os;
+    os << "SELECT ";
+    if (n.window_mode == tsx::WindowMode::Tumbling) {
+        std::ostringstream bucket;
+        bucket << "(" << ot << " - (" << ot << " % " << n.window_param << "))";
+        std::size_t o = 0;
+        for (std::uint32_t kc : n.window_keys) {
+            if (o) os << ", ";
+            os << "CAST((o" << kc << ") AS " << sql_type(cos.fields[kc].second)
+               << ") AS o" << o;
+            ++o;
+        }
+        if (o) os << ", ";
+        os << "CAST(" << bucket.str() << " AS " << sql_type(ttype) << ") AS o" << o;
+        ++o;
+        for (const AggSpec& a : n.window_aggs) {
+            os << ", ";
+            const Type in = (a.func == AggFunc::CountStar)
+                                ? Type::I64
+                                : cos.fields[a.input_col].second;
+            os << "CAST((" << agg_call_sql(a, cos) << ") AS "
+               << sql_type(agg_result_type(a.func, in)) << ") AS o" << o;
+            ++o;
+        }
+        os << " FROM (" << csql << ") AS " << alias << " GROUP BY ";
+        for (std::uint32_t kc : n.window_keys) os << "o" << kc << ", ";
+        os << bucket.str();
+        return os.str();
+    }
+
+    // SLIDING.
+    std::ostringstream over;
+    over << " OVER (";
+    if (!n.window_keys.empty()) {
+        over << "PARTITION BY ";
+        for (std::size_t i = 0; i < n.window_keys.size(); ++i)
+            over << (i ? ", " : "") << "o" << n.window_keys[i];
+        over << " ";
+    }
+    over << "ORDER BY " << ot << " ROWS BETWEEN " << n.window_param
+         << " PRECEDING AND CURRENT ROW)";
+    const std::string over_clause = over.str();
+
+    std::size_t o = 0;
+    for (std::size_t i = 0; i < cos.fields.size(); ++i) {
+        if (o) os << ", ";
+        os << "o" << i << " AS o" << o;
+        ++o;
+    }
+    for (const AggSpec& a : n.window_aggs) {
+        os << ", ";
+        const Type in = (a.func == AggFunc::CountStar)
+                            ? Type::I64
+                            : cos.fields[a.input_col].second;
+        os << "CAST((" << agg_call_sql(a, cos) << over_clause << ") AS "
+           << sql_type(agg_result_type(a.func, in)) << ") AS o" << o;
+        ++o;
+    }
+    os << " FROM (" << csql << ") AS " << alias;
+    return os.str();
+}
+
 std::string render_sort(const PlanNode& n, Ctx& ctx) {
     const Plan& child = n.children[0];
     const std::string csql = render(child, ctx);
@@ -242,6 +326,24 @@ std::string render_sort(const PlanNode& n, Ctx& ctx) {
     std::ostringstream os;
     os << "SELECT " << passthrough_cols(ncol) << " FROM (" << csql << ") AS "
        << ctx.next_alias() << " " << order_by_sql(n.sort_keys);
+    return os.str();
+}
+
+// WP-14 (additive): render a CompressedScan to the SAME SQL as a plain scan of its
+// INDEPENDENT reference Table (n.ctable_ref) — i.e. it loads the DECOMPRESSED source
+// into DuckDB. The engine path decodes n.ctable's compressed bytes independently, so
+// agreement between the two requires the codec to be truly lossless (the non-circular
+// split: the oracle never touches n.ctable; lowering never touches n.ctable_ref).
+std::string render_compressed_scan(const PlanNode& n, Ctx& ctx) {
+    const Schema& s = n.ctable_ref->schema();
+    const std::string& base = ctx.base_name(n.ctable_ref);
+    std::ostringstream os;
+    os << "SELECT ";
+    for (std::size_t i = 0; i < s.fields.size(); ++i) {
+        if (i) os << ", ";
+        os << s.fields[i].first << " AS o" << i;
+    }
+    os << " FROM " << base;
     return os.str();
 }
 
@@ -255,6 +357,8 @@ std::string render(const Plan& p, Ctx& ctx) {
         case PlanKind::Join: return render_join(n, ctx);
         case PlanKind::Sort: return render_sort(n, ctx);
         case PlanKind::AsofJoin: return render_asof(n, ctx);
+        case PlanKind::Window: return render_window(n, ctx);
+        case PlanKind::CompressedScan: return render_compressed_scan(n, ctx);
     }
     return "";  // unreachable
 }

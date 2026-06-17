@@ -651,6 +651,278 @@ ResultSet run_asof_reference(const Table& probe, const Table& build,
     return rs;
 }
 
+// ---- WP-13: windowed / time-bucketed aggregation reference -----------------
+namespace {
+
+// Encode an integer bucket lower edge `bstart` as a canonical key word for a
+// timestamp column of type `t` (so decode_key reproduces the engine's read-back).
+std::uint64_t bucket_word(std::int64_t bstart, Type t) {
+    std::uint64_t w = 0;
+    switch (t) {
+        case Type::I32:
+            w = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(static_cast<std::int32_t>(bstart)));
+            break;
+        case Type::I64:
+        case Type::TS:
+            std::memcpy(&w, &bstart, 8);
+            break;
+        default:
+            break;  // unreachable for a timestamp column
+    }
+    return w;
+}
+
+// Read a timestamp column value as int64 at row r (I32 widened, I64/TS verbatim),
+// independent of the engine. valid==false for a NULL timestamp.
+struct RefTs {
+    bool valid = false;
+    std::int64_t t = 0;
+};
+RefTs read_ts(const Column& c, std::size_t r) {
+    RefTs out;
+    out.valid = c.all_valid || validity::get_bit(c.validity, r);
+    if (!out.valid) return out;
+    switch (c.type) {
+        case Type::I32:
+            out.t = reinterpret_cast<const std::int32_t*>(c.data)[r];
+            break;
+        case Type::I64:
+        case Type::TS:
+            out.t = reinterpret_cast<const std::int64_t*>(c.data)[r];
+            break;
+        default:
+            out.valid = false;
+            break;
+    }
+    return out;
+}
+
+// Finalize accumulator `acc` of aggregate `spec` (input type `in_type`) into a Cell,
+// independent of the engine's finalizer. `frame_rows` is the COUNT(*) frame size.
+Cell finalize_acc(const AggSpec& spec, const Acc& acc, Type in_type, bool is_float,
+                  std::int64_t frame_rows) {
+    Cell c;
+    const Type rt = agg_result_type(spec.func, in_type);
+    switch (spec.func) {
+        case AggFunc::CountStar:
+            c.i = frame_rows;
+            break;
+        case AggFunc::Count:
+            c.i = acc.cnt;
+            break;
+        case AggFunc::Sum:
+            if (acc.cnt == 0) c.is_null = true;
+            else if (rt == Type::F64) c.f = acc.d;
+            else c.i = acc.i;
+            break;
+        case AggFunc::Min:
+        case AggFunc::Max:
+            if (acc.cnt == 0) c.is_null = true;
+            else if (rt == Type::F64) c.f = acc.d;
+            else c.i = acc.i;
+            break;
+        case AggFunc::Avg:
+            if (acc.cnt == 0) c.is_null = true;
+            else c.f = (is_float ? acc.d : static_cast<double>(acc.i)) /
+                       static_cast<double>(acc.cnt);
+            break;
+    }
+    return c;
+}
+
+}  // namespace
+
+ResultSet run_window_reference(const Table& input, qe::tsx::WindowMode mode,
+                               const std::vector<std::uint32_t>& keys,
+                               std::uint32_t time, std::int64_t param,
+                               const std::vector<AggSpec>& aggs) {
+    const Schema& cs = input.schema();
+    ResultSet rs;
+
+    // Per-agg input type / float-ness (shared by both modes).
+    std::vector<Type> in_type(aggs.size(), Type::I64);
+    std::vector<bool> is_float(aggs.size(), false);
+    for (std::size_t a = 0; a < aggs.size(); ++a) {
+        if (aggs[a].func != AggFunc::CountStar) {
+            in_type[a] = cs.fields[aggs[a].input_col].second;
+            is_float[a] = in_type[a] == Type::F64;
+        }
+    }
+
+    const Batch full = input.full_batch_view();
+    const std::size_t n = input.num_rows();
+    const Type ttype = cs.fields[time].second;
+
+    if (mode == qe::tsx::WindowMode::Tumbling) {
+        // Output types: partition keys, bucket (time type), agg results.
+        for (std::uint32_t kc : keys) rs.types.push_back(cs.fields[kc].second);
+        rs.types.push_back(ttype);
+        for (std::size_t a = 0; a < aggs.size(); ++a)
+            rs.types.push_back(agg_result_type(aggs[a].func, in_type[a]));
+
+        using KeyTuple = std::vector<std::pair<bool, std::uint64_t>>;
+        std::map<KeyTuple, std::size_t> index;
+        std::vector<KeyTuple> group_keys;
+        std::vector<std::vector<Acc>> group_acc;  // [group][agg]
+
+        for (std::size_t r = 0; r < n; ++r) {
+            KeyTuple kt;
+            kt.reserve(keys.size() + 1);
+            for (std::uint32_t kc : keys)
+                kt.push_back(key_word(full.cols[kc], r, cs.fields[kc].second));
+            // Derived bucket: (t / W) * W. NULL timestamp => a NULL bucket key
+            // (grouped together, like DuckDB's GROUP BY on a NULL expression).
+            const RefTs tv = read_ts(full.cols[time], r);
+            if (!tv.valid) {
+                kt.emplace_back(true, 0);
+            } else {
+                const std::int64_t bstart = (tv.t / param) * param;
+                kt.emplace_back(false, bucket_word(bstart, ttype));
+            }
+
+            std::size_t g;
+            auto it = index.find(kt);
+            if (it == index.end()) {
+                g = group_acc.size();
+                index.emplace(kt, g);
+                group_keys.push_back(kt);
+                std::vector<Acc> accs(aggs.size());
+                for (std::size_t a = 0; a < aggs.size(); ++a)
+                    accs[a] = init_acc(aggs[a].func);
+                group_acc.push_back(std::move(accs));
+            } else {
+                g = it->second;
+            }
+            for (std::size_t a = 0; a < aggs.size(); ++a) {
+                const AggSpec& spec = aggs[a];
+                Acc& acc = group_acc[g][a];
+                if (spec.func == AggFunc::CountStar) {
+                    ++acc.cnt;
+                    continue;
+                }
+                const Num v = read_num(full.cols[spec.input_col], r);
+                if (spec.func == AggFunc::Count) {
+                    if (v.valid) ++acc.cnt;
+                } else if (v.valid) {
+                    switch (spec.func) {
+                        case AggFunc::Sum:
+                        case AggFunc::Avg:
+                            if (is_float[a]) acc.d += v.d; else acc.i += v.i;
+                            break;
+                        case AggFunc::Min:
+                            if (is_float[a]) acc.d = std::min(acc.d, v.d);
+                            else acc.i = std::min(acc.i, v.i);
+                            break;
+                        case AggFunc::Max:
+                            if (is_float[a]) acc.d = std::max(acc.d, v.d);
+                            else acc.i = std::max(acc.i, v.i);
+                            break;
+                        default: break;
+                    }
+                    ++acc.cnt;
+                }
+            }
+        }
+
+        for (std::size_t g = 0; g < group_acc.size(); ++g) {
+            std::vector<Cell> row;
+            row.reserve(keys.size() + 1 + aggs.size());
+            for (std::size_t j = 0; j < keys.size(); ++j)
+                row.push_back(decode_key(group_keys[g][j].first,
+                                         group_keys[g][j].second,
+                                         cs.fields[keys[j]].second));
+            row.push_back(decode_key(group_keys[g][keys.size()].first,
+                                     group_keys[g][keys.size()].second, ttype));
+            for (std::size_t a = 0; a < aggs.size(); ++a)
+                row.push_back(finalize_acc(aggs[a], group_acc[g][a], in_type[a],
+                                           is_float[a], group_acc[g][a].cnt));
+            rs.rows.push_back(std::move(row));
+        }
+        return rs;
+    }
+
+    // ---- SLIDING ----
+    // Output types: all child columns, then agg results.
+    for (const auto& f : cs.fields) rs.types.push_back(f.second);
+    for (std::size_t a = 0; a < aggs.size(); ++a)
+        rs.types.push_back(agg_result_type(aggs[a].func, in_type[a]));
+
+    // Partition rows by the canonical key tuple (kEqual: NULLs group together).
+    using KeyTuple = std::vector<std::pair<bool, std::uint64_t>>;
+    std::map<KeyTuple, std::vector<std::size_t>> parts;
+    for (std::size_t r = 0; r < n; ++r) {
+        KeyTuple kt;
+        kt.reserve(keys.size());
+        for (std::uint32_t kc : keys)
+            kt.push_back(key_word(full.cols[kc], r, cs.fields[kc].second));
+        parts[kt].push_back(r);
+    }
+
+    const std::int64_t P = param;
+    for (auto& [kt, rows] : parts) {
+        (void)kt;
+        // Order the partition by timestamp ascending; original-index tiebreak makes
+        // it a stable TOTAL order (the generators keep per-partition ts distinct).
+        std::stable_sort(rows.begin(), rows.end(),
+                         [&](std::size_t x, std::size_t y) {
+                             const std::int64_t tx = read_ts(full.cols[time], x).t;
+                             const std::int64_t ty = read_ts(full.cols[time], y).t;
+                             if (tx != ty) return tx < ty;
+                             return x < y;
+                         });
+        for (std::size_t p = 0; p < rows.size(); ++p) {
+            const std::size_t lo = (static_cast<std::int64_t>(p) > P)
+                                       ? p - static_cast<std::size_t>(P)
+                                       : 0;
+            // Brute-force aggregate over the frame [lo, p] in time order.
+            std::vector<Acc> acc(aggs.size());
+            for (std::size_t a = 0; a < aggs.size(); ++a)
+                acc[a] = init_acc(aggs[a].func);
+            for (std::size_t q = lo; q <= p; ++q) {
+                const std::size_t rr = rows[q];
+                for (std::size_t a = 0; a < aggs.size(); ++a) {
+                    const AggSpec& spec = aggs[a];
+                    if (spec.func == AggFunc::CountStar) continue;
+                    const Num v = read_num(full.cols[spec.input_col], rr);
+                    if (spec.func == AggFunc::Count) {
+                        if (v.valid) ++acc[a].cnt;
+                    } else if (v.valid) {
+                        switch (spec.func) {
+                            case AggFunc::Sum:
+                            case AggFunc::Avg:
+                                if (is_float[a]) acc[a].d += v.d;
+                                else acc[a].i += v.i;
+                                break;
+                            case AggFunc::Min:
+                                if (is_float[a]) acc[a].d = std::min(acc[a].d, v.d);
+                                else acc[a].i = std::min(acc[a].i, v.i);
+                                break;
+                            case AggFunc::Max:
+                                if (is_float[a]) acc[a].d = std::max(acc[a].d, v.d);
+                                else acc[a].i = std::max(acc[a].i, v.i);
+                                break;
+                            default: break;
+                        }
+                        ++acc[a].cnt;
+                    }
+                }
+            }
+            const std::int64_t frame_rows =
+                static_cast<std::int64_t>(p) - static_cast<std::int64_t>(lo) + 1;
+            std::vector<Cell> row;
+            row.reserve(cs.fields.size() + aggs.size());
+            for (std::size_t c = 0; c < cs.fields.size(); ++c)
+                row.push_back(read_cell_col(full.cols[c], rows[p]));
+            for (std::size_t a = 0; a < aggs.size(); ++a)
+                row.push_back(finalize_acc(aggs[a], acc[a], in_type[a],
+                                           is_float[a], frame_rows));
+            rs.rows.push_back(std::move(row));
+        }
+    }
+    return rs;
+}
+
 // ---- WP-8: plan reference interpreter --------------------------------------
 namespace {
 
@@ -764,6 +1036,22 @@ ResultSet eval_rs(const Plan& p) {
             return run_asof_reference(lt, rt, n.asof_left_keys, n.asof_right_keys,
                                       n.asof_left_time, n.asof_right_time,
                                       n.asof_type, n.asof_tolerance);
+        }
+        case PlanKind::Window: {  // WP-13 (additive arm)
+            const Plan& c = n.children[0];
+            const Table ct = rs_to_table(eval_rs(c), c.output_schema());
+            return run_window_reference(ct, n.window_mode, n.window_keys,
+                                        n.window_time, n.window_param,
+                                        n.window_aggs);
+        }
+        case PlanKind::CompressedScan: {  // WP-14 (additive arm)
+            // The INDEPENDENT reference reads ONLY the decompressed source Table
+            // (n.ctable_ref) — never the engine's own decode of n.ctable. Treated as
+            // a plain scan: identity-project every source column. Agreement with the
+            // engine (which decodes n.ctable) therefore requires lossless decode.
+            LogicalQuery q;
+            q.projections = identity_projections(n.ctable_ref->schema());
+            return run_reference(*n.ctable_ref, q);
         }
     }
     return {};  // unreachable

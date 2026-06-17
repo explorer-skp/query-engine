@@ -597,6 +597,138 @@ AsofCase gen_asof_case(std::mt19937_64& rng) {
     return c;
 }
 
+WindowCase gen_window_case(std::mt19937_64& rng) {
+    const bool tumbling = (rng() % 2) == 0;
+    const int nk = static_cast<int>(rng() % 3);  // 0 / 1 / 2 partition keys
+    std::vector<Type> kt(static_cast<std::size_t>(nk));
+    for (int j = 0; j < nk; ++j)
+        kt[static_cast<std::size_t>(j)] = rand_key_type(rng);
+    const Type ttype = rand_time_type(rng);
+
+    // Row count: usually small (crosses the 64/256 batch boundaries with a tail);
+    // ~1/4 of cases are large enough to straddle a full 2048 batch; some are empty.
+    std::size_t n = static_cast<std::size_t>(rng() % 512);
+    if (rng() % 4 == 0) n += static_cast<std::size_t>(rng() % 4096);
+
+    // Globally-distinct timestamps in [0, HI] satisfy BOTH constraints at once:
+    // >= 0 (tumbling divergence-free) AND per-partition distinct (sliding total
+    // order). HI is far wider than n so rejection sampling terminates fast and
+    // fits I32 when the time column is I32.
+    const std::int64_t HI =
+        static_cast<std::int64_t>(16 * (n + 1)) + 256;
+    const std::vector<std::int64_t> ts = distinct_timestamps(rng, n, 0, HI);
+
+    const int D = 1 + static_cast<int>(rng() % 8);  // key cardinality 1..8
+    std::vector<std::vector<std::int64_t>> dom(
+        static_cast<std::size_t>(nk), std::vector<std::int64_t>(D));
+    for (int j = 0; j < nk; ++j)
+        for (int t = 0; t < D; ++t)
+            dom[static_cast<std::size_t>(j)][t] = rand_in(rng, 0, 99);
+    const int keynull_pct = static_cast<int>(rng() % 20);  // NULL partition keys
+    const int npay = static_cast<int>(rng() % 3);  // 0..2 payload columns
+
+    // Schema: c0..c{nk-1} keys, c{nk} timestamp, then payloads.
+    Schema s;
+    for (int j = 0; j < nk; ++j)
+        s.fields.emplace_back("c" + std::to_string(j),
+                              kt[static_cast<std::size_t>(j)]);
+    s.fields.emplace_back("c" + std::to_string(nk), ttype);
+    std::vector<Type> pay(static_cast<std::size_t>(npay));
+    for (int j = 0; j < npay; ++j) {
+        pay[static_cast<std::size_t>(j)] = rand_type(rng);
+        s.fields.emplace_back("c" + std::to_string(nk + 1 + j),
+                              pay[static_cast<std::size_t>(j)]);
+    }
+
+    // Build the columns.
+    std::vector<OwnedColumn> cols;
+    std::vector<OwnedColumn> kcols(static_cast<std::size_t>(nk));
+    for (int j = 0; j < nk; ++j)
+        kcols[static_cast<std::size_t>(j)] =
+            OwnedColumn::make(kt[static_cast<std::size_t>(j)], n);
+    OwnedColumn tcol = OwnedColumn::make(ttype, n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const bool null_key =
+            keynull_pct > 0 && static_cast<int>(rng() % 100) < keynull_pct;
+        const int null_col =
+            (null_key && nk > 0) ? static_cast<int>(rng() % nk) : -1;
+        const int t = static_cast<int>(rng() % static_cast<unsigned>(D));
+        for (int j = 0; j < nk; ++j) {
+            put_key(kcols[static_cast<std::size_t>(j)],
+                    kt[static_cast<std::size_t>(j)], i,
+                    dom[static_cast<std::size_t>(j)][t]);
+            if (j == null_col) kcols[static_cast<std::size_t>(j)].set_null(i);
+        }
+        put_time(tcol, ttype, i, ts[i]);  // never NULL
+    }
+    for (int j = 0; j < nk; ++j) cols.push_back(std::move(kcols[static_cast<std::size_t>(j)]));
+    cols.push_back(std::move(tcol));
+    for (int j = 0; j < npay; ++j)
+        cols.push_back(gen_column(rng, pay[static_cast<std::size_t>(j)], n, 15));
+
+    WindowCase c{Table(s, std::move(cols)),
+                 tumbling ? qe::tsx::WindowMode::Tumbling
+                          : qe::tsx::WindowMode::Sliding,
+                 {},
+                 static_cast<std::uint32_t>(nk),
+                 1,
+                 {}};
+    for (int j = 0; j < nk; ++j) c.keys.push_back(static_cast<std::uint32_t>(j));
+
+    // Param from a small set (bucket width W > 0 / preceding row count P >= 0).
+    if (tumbling) {
+        static const std::int64_t kW[] = {1, 2, 5, 10, 100, 1000, 5000};
+        c.param = kW[rng() % (sizeof(kW) / sizeof(kW[0]))];
+    } else {
+        static const std::int64_t kP[] = {0, 1, 2, 5, 10, 50};
+        c.param = kP[rng() % (sizeof(kP) / sizeof(kP[0]))];
+    }
+
+    // Aggregate subset: 1..4. SUM/AVG over numeric columns only (the magnitude
+    // bounds keep every per-bucket / per-frame integer sum within the I64
+    // accumulator). MIN/MAX/COUNT over any column. Reuse the AggSpec vocabulary.
+    const std::uint32_t ncols = static_cast<std::uint32_t>(s.fields.size());
+    std::vector<std::uint32_t> numeric;
+    for (std::uint32_t i = 0; i < ncols; ++i)
+        if (is_numeric(s.fields[i].second)) numeric.push_back(i);
+    const int na = 1 + static_cast<int>(rng() % 4);
+    for (int i = 0; i < na; ++i) {
+        const std::string name = "a" + std::to_string(i);
+        switch (rng() % 6) {
+            case 0:
+                c.aggs.push_back(AggSpec::count_star(name));
+                break;
+            case 1:
+                c.aggs.push_back(
+                    AggSpec::count(static_cast<std::uint32_t>(rng() % ncols), name));
+                break;
+            case 2:
+                if (!numeric.empty())
+                    c.aggs.push_back(
+                        AggSpec::sum(numeric[rng() % numeric.size()], name));
+                else
+                    c.aggs.push_back(AggSpec::count_star(name));
+                break;
+            case 3:
+                if (!numeric.empty())
+                    c.aggs.push_back(
+                        AggSpec::avg(numeric[rng() % numeric.size()], name));
+                else
+                    c.aggs.push_back(AggSpec::count_star(name));
+                break;
+            case 4:
+                c.aggs.push_back(
+                    AggSpec::min(static_cast<std::uint32_t>(rng() % ncols), name));
+                break;
+            default:
+                c.aggs.push_back(
+                    AggSpec::max(static_cast<std::uint32_t>(rng() % ncols), name));
+                break;
+        }
+    }
+    return c;
+}
+
 PlanCase gen_plan_case(std::mt19937_64& rng) {
     // Two correlated tables (probe/build) sharing key column(s) 0..nk-1.
     JoinCase jc = gen_join_case(rng);

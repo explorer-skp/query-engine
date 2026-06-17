@@ -54,6 +54,8 @@
 #include "ops/sort.h"       // SortKey / SortDir / NullOrder
 #include "ops/table.h"      // Table
 #include "tsx/asof.h"       // WP-12: AsofType (additive Phase-2 plan extension)
+#include "tsx/window.h"     // WP-13: WindowMode (additive Phase-2 plan extension)
+#include "tsx/compress.h"   // WP-14: CompressedTable (additive Phase-2 plan extension)
 
 namespace qe::plan {
 
@@ -62,7 +64,16 @@ namespace qe::plan {
 // oracle catches — see plan/plan_mutants.h).
 // WP-12 (additive): AsofJoin is APPENDED — the existing six enumerators keep their
 // values/order byte-unchanged (verified at audit via `git diff`).
-enum class PlanKind { Scan, Filter, Project, Aggregate, Join, Sort, AsofJoin };
+// WP-13 (additive): Window is APPENDED after AsofJoin — every existing enumerator
+// keeps its value/order byte-unchanged. The enum is in-memory only and never
+// serialized; nothing relies on Window's integer value (the final review linearizes
+// it against any sibling Phase-2 enumerator at integration).
+// WP-14 (additive): CompressedScan is APPENDED after Window — every existing
+// enumerator keeps its value/order byte-unchanged. The enum is in-memory only and
+// never serialized; nothing relies on CompressedScan's integer value.
+enum class PlanKind {
+    Scan, Filter, Project, Aggregate, Join, Sort, AsofJoin, Window,
+    CompressedScan };
 
 // A column reference for KEY LISTS (group/join/sort keys): EITHER a physical
 // index into the child's output schema OR a name resolved against that schema at
@@ -124,6 +135,27 @@ struct PlanNode {
     std::uint32_t asof_right_time = 0;            // AsofJoin build timestamp col
     tsx::AsofType asof_type = tsx::AsofType::Inner;
     std::optional<std::int64_t> asof_tolerance;   // unset => unbounded
+
+    // WP-13 (additive): Window fields. Independent of all existing fields so every
+    // existing field stays byte-unchanged. `window_keys` are the equality partition
+    // keys (child-output indices; possibly empty), `window_time` the single
+    // timestamp column, `window_param` the bucket width W (Tumbling) or the PRECEDING
+    // row count P (Sliding), `window_aggs` the aggregates (reusing AggSpec verbatim).
+    tsx::WindowMode window_mode = tsx::WindowMode::Tumbling;
+    std::vector<std::uint32_t> window_keys;       // Window partition-equality keys
+    std::uint32_t window_time = 0;                // Window timestamp column
+    std::int64_t window_param = 0;                // W (tumbling) / P (sliding)
+    std::vector<AggSpec> window_aggs;             // Window aggregates
+
+    // WP-14 (additive): CompressedScan fields. Independent of all existing fields.
+    // `ctable` is the ENGINE source — lowering decodes from this ONLY. `ctable_ref`
+    // is the INDEPENDENT decompressed/source reference Table, read by the oracle SQL
+    // renderer + the plan reference ONLY (the non-circular split: engine decodes the
+    // compressed bytes, the oracle loads the original source, so the differential
+    // proves engine-decode == source iff the codec is truly lossless). Both borrowed;
+    // both must outlive the plan and any lowered tree.
+    const tsx::CompressedTable* ctable = nullptr;  // CompressedScan engine source
+    const Table* ctable_ref = nullptr;             // CompressedScan oracle reference
 };
 
 // An immutable, shared, value-semantics handle to a PlanNode (mirrors expr::Expr).
@@ -194,6 +226,22 @@ class PlanBuilder {
                           std::optional<std::int64_t> tolerance =
                               std::nullopt) const;
 
+    // WP-13 (additive): windowed / time-bucketed aggregation. Both builders resolve
+    // their `keys`/`time` ColRefs against the child schema at build time (like
+    // aggregate()), validate the timestamp column is TS/I32/I64, and derive the
+    // output schema WITHOUT executing.
+    //  * window_tumbling: GROUP BY (keys…, t/`width` bucket); `width` (W) > 0. Output
+    //    = [keys…, bucket_start(time type), agg result columns…].
+    //  * window_sliding: running aggregate over ROWS BETWEEN `preceding` (P >= 0)
+    //    PRECEDING AND CURRENT ROW, partitioned by `keys`, ordered by `time`. Output
+    //    = [all child columns…, agg result columns…] (one row per input row).
+    PlanBuilder window_tumbling(std::vector<ColRef> keys, ColRef time,
+                                std::int64_t width,
+                                std::vector<AggSpec> aggs) const;
+    PlanBuilder window_sliding(std::vector<ColRef> keys, ColRef time,
+                               std::int64_t preceding,
+                               std::vector<AggSpec> aggs) const;
+
     // The assembled plan (the single source of truth feeding engine + oracle).
     const Plan& plan() const { return plan_; }
     // Implicit so `.join(plan::scan(other), ...)` accepts a builder where a Plan
@@ -214,5 +262,14 @@ class PlanBuilder {
 
 // Leaf: scan `table` (BORROWED — it must outlive the plan and any lowered tree).
 PlanBuilder scan(const Table& table);
+
+// WP-14 (additive) leaf: scan a COMPRESSED table, decoding batch-by-batch. `ct` is
+// the engine source — lowering builds a tsx::CompressedScan over it and decodes ONLY
+// its compressed bytes. `reference` is the INDEPENDENT decompressed/source Table the
+// oracle (DuckDB SQL + the plan reference) loads instead — never the engine's own
+// decode output (that would be circular). The node's output schema is ct.schema().
+// BOTH `ct` and `reference` are BORROWED and must outlive the plan and any lowered
+// tree. (See PlanNode::ctable / ctable_ref for the non-circularity contract.)
+PlanBuilder compressed_scan(const tsx::CompressedTable& ct, const Table& reference);
 
 }  // namespace qe::plan
