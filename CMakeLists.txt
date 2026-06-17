@@ -319,6 +319,28 @@ else()
                  "only (stage third_party/duckdb/; see VENDORING.md)")
 endif()
 
+# --- WP-10b: optional, additive parallel-execution layer (decision D15) -------
+# qe_parallel wraps the FROZEN operators (no interface change) with a morsel-driven
+# multithreaded driver (exec/parallel.h). MorselScan (exec/morsel_scan.*) is a
+# 64-aligned row-range Scan; the engine composes the frozen ops + plan. It links
+# qe_oracle ONLY for the materialized ResultSet currency + drain_operator (NOT for
+# DuckDB — qe_parallel never includes DuckDB, so the from-scratch gate over exec/
+# stays green). Threads are configuration; no core count / width / ISA is baked.
+add_library(qe_parallel STATIC
+  exec/morsel_scan.cpp
+  exec/parallel.cpp)
+target_link_libraries(qe_parallel PUBLIC qe_oracle)
+find_package(Threads REQUIRED)
+target_link_libraries(qe_parallel PUBLIC Threads::Threads)
+
+# Test-only planted PARALLELISM mutant: a cross-worker partial-aggregate merge that
+# DROPS partials (overwrite instead of accumulate) — a bug that bites ONLY with >1
+# worker. NOT linked into any engine target — only the WP-10b mutation self-test +
+# the catalog meta-test. Derives qe::exec::ParallelEngine and overrides only the
+# three merge hooks, so it differs from the real driver by exactly that merge step.
+add_library(qe_parallel_mutants STATIC exec/parallel_mutants.cpp)
+target_link_libraries(qe_parallel_mutants PUBLIC qe_parallel)
+
 # --- WP-4: hash table substrate (shared by WP-5 aggregation, WP-6 join) -------
 # qe_hashtable is the open-addressing linear-probe table + its from-scratch
 # mixing hash. Only the vector kernel TU (ops/hash_kernels.cpp) pulls in Highway
@@ -727,6 +749,39 @@ target_link_libraries(compress_mutation_test
 add_test(NAME compress_mutation_test
   COMMAND compress_mutation_test --seed ${QE_CI_SEED})
 
+# ============================================================================
+# WP-10b: optional parallel-execution path (decision D15). The parallel driver
+# (qe_parallel) must produce results IDENTICAL to the single-thread plan path under
+# the oracle, at thread counts {1,2,4,8} and several morsel sizes; and TSan must be
+# green (the new gate — these targets build under the `tsan` preset like every test,
+# no per-test gating). Mac scaling is NOT credible (§2): no scaling number is
+# claimed here — the deliverable is CORRECTNESS + TSan-green. CI pins QE_CI_SEED.
+# ============================================================================
+
+# Parallel DIFFERENTIAL: every generated plan shape (the WP-8 generators) run through
+# the parallel driver == single-thread == reference == DuckDB (when staged), across
+# {1,2,4,8} threads and morsel sizes. Links qe_oracle (engine + reference + DuckDB)
+# + qe_parallel (the driver under test). DuckDB over many cases under TSan is slow ->
+# generous timeout.
+add_executable(wp10b_parallel_differential_test
+  tests/wp1_test_main.cpp tests/wp10b_parallel_differential_test.cpp)
+target_link_libraries(wp10b_parallel_differential_test
+  PRIVATE doctest qe_oracle qe_parallel)
+add_test(NAME wp10b_parallel_differential_test
+  COMMAND wp10b_parallel_differential_test --seed ${QE_CI_SEED})
+set_tests_properties(wp10b_parallel_differential_test PROPERTIES TIMEOUT 900)
+
+# Parallel MUTATION self-test: the planted cross-worker merge-drop mutant
+# (qe_parallel_mutants) is CLEAN at 1 thread and FLAGGED at 2/4/8 — vs single-thread
+# AND reference (and DuckDB when staged). Proves the parallel differential can fail.
+add_executable(wp10b_parallel_mutation_test
+  tests/wp1_test_main.cpp tests/wp10b_parallel_mutation_test.cpp)
+target_link_libraries(wp10b_parallel_mutation_test
+  PRIVATE doctest qe_oracle qe_parallel qe_parallel_mutants)
+add_test(NAME wp10b_parallel_mutation_test
+  COMMAND wp10b_parallel_mutation_test --seed ${QE_CI_SEED})
+set_tests_properties(wp10b_parallel_mutation_test PROPERTIES TIMEOUT 300)
+
 # WP-14 ratio + decode-throughput reporting driver (the §5 "reported" numbers).
 # Mac/NEON numbers are preliminary / relative-only (§2). Links qe_tsx + bench_infra.
 add_executable(bench_compress bench/bench_compress_main.cpp)
@@ -833,6 +888,7 @@ add_executable(mutation_catalog_meta_test
   tests/catalog_checks_asof.cpp
   tests/catalog_checks_window.cpp
   tests/catalog_checks_compress.cpp
+  tests/catalog_checks_parallel.cpp
   tests/catalog_mutants.cpp)
 target_link_libraries(mutation_catalog_meta_test PRIVATE
   doctest
@@ -846,7 +902,8 @@ target_link_libraries(mutation_catalog_meta_test PRIVATE
   qe_plan_mutants
   qe_asof_mutants
   qe_window_mutants
-  qe_compress_mutants)
+  qe_compress_mutants
+  qe_parallel_mutants)
 add_test(NAME mutation_catalog_meta_test
   COMMAND mutation_catalog_meta_test --seed ${QE_CI_SEED})
 # Runs DuckDB over several queries when staged; generous wall-clock under sanitizers.

@@ -83,6 +83,9 @@ std::vector<Entry> build_catalog() {
         {"compress_decode_drift", Hazard::kOperatorOrchestration,
          "tsx::mutant::CompressedScan{kDropSecondDerivative}",
          "compress_mutation_test", ck::compress_decode_drift},
+        {"parallel_merge_drop_partial", Hazard::kOperatorOrchestration,
+         "mutant::ParallelEngine{kMergeDropPartial}", "wp10b_parallel_mutation_test",
+         ck::parallel_merge_drop_partial},
     };
 }
 

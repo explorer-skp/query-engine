@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 
 # Engine module dirs the from-scratch rule covers. tests/ and oracle/ are EXEMPT
 # (the oracle deliberately links DuckDB/SQLite in a later WP).
-MODULE_DIRS=(core simd expr ops plan tsx)
+MODULE_DIRS=(core simd expr ops plan tsx exec)
 
 # Forbidden library tokens, matched as a path component of an #include or as a
 # CMake link/find target. Word-ish boundaries keep false positives down.

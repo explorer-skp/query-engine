@@ -38,4 +38,7 @@ Verdict window_frame_off_by_one();
 // compressed scan (tests/catalog_checks_compress.cpp) — WP-14
 Verdict compress_decode_drift();
 
+// parallel execution (tests/catalog_checks_parallel.cpp) — WP-10b
+Verdict parallel_merge_drop_partial();
+
 }  // namespace qe::catalog::checks
