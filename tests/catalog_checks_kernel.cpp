@@ -160,7 +160,7 @@ Verdict float_to_int_round() {
                                                vals.size());
     ResultSet mut;
     mut.types = {Type::I64};
-    for (std::int64_t x : buggy) mut.rows.push_back({Cell{false, x, 0.0}});
+    for (std::int64_t x : buggy) mut.rows.push_back({Cell{false, x, 0.0, {}}});
 
     const DiffResult md = diff_with_duckdb(mut, ref, duckdb, /*ordered=*/false);
     v.mutant_flagged = !md.equal;
@@ -194,7 +194,7 @@ Verdict aggregation_overflow() {
         catalog::mutant::sum_i64_wrapping_i32(vals.data(), vals.size());
     ResultSet mut;
     mut.types = {agg_result_type(AggFunc::Sum, Type::I64)};  // I64
-    mut.rows.push_back({Cell{false, buggy, 0.0}});
+    mut.rows.push_back({Cell{false, buggy, 0.0, {}}});
 
     const DiffResult md = diff_with_duckdb(mut, ref, duckdb, /*ordered=*/false);
     v.mutant_flagged = !md.equal;

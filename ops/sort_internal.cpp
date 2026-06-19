@@ -23,6 +23,10 @@ std::int64_t MaterializedColumns::int_at(std::size_t col, std::size_t row) const
         case Type::F64:
             // Not order-preserving as an int; callers use f64_at for F64.
             return 0;
+        case Type::STR:
+            // STR is ordered by VALUE via str_at (comparison path); never radix-
+            // encoded (radix_eligible excludes it) and never read as an int.
+            return 0;
     }
     return 0;
 }
@@ -37,10 +41,13 @@ MaterializedColumns materialize(Operator& child, const Schema& schema) {
     mat.types.reserve(ncol);
     mat.data.resize(ncol);
     mat.valid.resize(ncol);
+    mat.dicts.assign(ncol, nullptr);  // WP-7b: per-STR-column owned canonical dict
     std::vector<std::size_t> width(ncol);
     for (std::size_t c = 0; c < ncol; ++c) {
-        mat.types.push_back(schema.fields[c].second);
-        width[c] = byte_width(schema.fields[c].second);
+        const Type t = schema.fields[c].second;
+        mat.types.push_back(t);
+        width[c] = byte_width(t);
+        if (t == Type::STR) mat.dicts[c] = std::make_shared<StringDict>();
     }
 
     child.open();
@@ -53,8 +60,21 @@ MaterializedColumns materialize(Operator& child, const Schema& schema) {
                 const Column& col = b.cols[c];
                 const bool ok =
                     col.all_valid || validity::get_bit(col.validity, phys);
-                const std::byte* src = col.data + phys * width[c];
-                mat.data[c].insert(mat.data[c].end(), src, src + width[c]);
+                if (mat.types[c] == Type::STR) {
+                    // WP-7b: re-intern the string VALUE into the owned dict and
+                    // store the canonical code (the source dict dies after drain).
+                    std::int32_t canon = 0;
+                    if (ok) {
+                        const auto src_code =
+                            reinterpret_cast<const std::int32_t*>(col.data)[phys];
+                        canon = mat.dicts[c]->intern(col.dict->at(src_code));
+                    }
+                    const auto* cb = reinterpret_cast<const std::byte*>(&canon);
+                    mat.data[c].insert(mat.data[c].end(), cb, cb + 4);
+                } else {
+                    const std::byte* src = col.data + phys * width[c];
+                    mat.data[c].insert(mat.data[c].end(), src, src + width[c]);
+                }
                 mat.valid[c].push_back(ok ? 1 : 0);
             }
         }
@@ -84,7 +104,8 @@ OwnedBatch gather_rows(const MaterializedColumns& mat, const std::uint32_t* perm
         const std::byte* src = mat.col_data(c);
 
         switch (t) {
-            case Type::I32: {
+            case Type::I32:
+            case Type::STR: {  // WP-7b: STR = int32 dict code; gather the codes
                 auto* d = reinterpret_cast<std::uint32_t*>(dst);
                 const auto* s = reinterpret_cast<const std::uint32_t*>(src);
                 if (use_vector_gather)
@@ -113,6 +134,10 @@ OwnedBatch gather_rows(const MaterializedColumns& mat, const std::uint32_t* perm
                 break;
             }
         }
+
+        // WP-7b: STR output codes index the materialized owned dict (alive for the
+        // sort's lifetime); attach it so the gathered column resolves correctly.
+        if (t == Type::STR) oc.set_dict(mat.col_dict(c));
 
         // Rebuild validity for the gathered rows (scalar; the bitmap is not the
         // SIMD story). Only allocate a bitmap if a null actually lands here.

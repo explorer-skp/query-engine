@@ -27,8 +27,11 @@
 #include <algorithm>
 #include <cassert>
 #include <limits>
+#include <stdexcept>
+#include <string_view>
 #include <utility>
 
+#include "core/string_dict.h"
 #include "ops/agg_internal.h"
 #include "ops/agg_kernels.h"
 
@@ -53,6 +56,13 @@ struct Aggregate::State {
     // scratch reused across batches by the global kernel path
     std::vector<std::int64_t> scratch_i;
     std::vector<double> scratch_d;
+
+    // WP-7b: the aggregate's OWNED canonical string dict. STR group keys and
+    // MIN/MAX(str) results are interned here (by string VALUE) during the drain so
+    // that (a) equal strings from any source dict share one code => the frozen
+    // HashTable groups them together, and (b) the codes the output columns publish
+    // stay valid AFTER the child (and its dicts) are closed at end-of-drain.
+    std::shared_ptr<StringDict> str_dict;
 };
 
 Aggregate::Aggregate(std::unique_ptr<Operator> child,
@@ -71,12 +81,17 @@ Type agg_result_type(AggFunc func, Type input) {
         case AggFunc::Count:
             return Type::I64;
         case AggFunc::Sum:
+            // WP-7b: SUM(str)/AVG(str) are type errors (DuckDB rejects them too).
+            if (input == Type::STR)
+                throw std::invalid_argument("SUM is not defined on STR (VARCHAR)");
             return input == Type::F64 ? Type::F64 : Type::I64;  // SUM(int)->I64
         case AggFunc::Avg:
+            if (input == Type::STR)
+                throw std::invalid_argument("AVG is not defined on STR (VARCHAR)");
             return Type::F64;
         case AggFunc::Min:
         case AggFunc::Max:
-            return input;  // same type as the input column
+            return input;  // same type as the input column (STR -> STR by VALUE)
     }
     return Type::I64;  // unreachable
 }
@@ -137,6 +152,43 @@ inline void scatter_row(detail::AggCell& cell, AggFunc func, bool is_float,
     }
 }
 
+// WP-7b: canonicalize one STR key column into `dst` (the aggregate's owned dict),
+// preserving the source's PHYSICAL layout and validity (so the batch's selection
+// vector still indexes it correctly). Equal string VALUES — even from different
+// source dicts — get the same code in `dst`, so the frozen HashTable (which hashes
+// the raw code via normalize_value) groups them together, and the group-key
+// read-back is a code valid in `dst` after the child closes. Grouping by raw,
+// un-canonicalized codes would be the "by code not by value" hazard.
+OwnedColumn canonicalize_str_key(const Column& src, StringDict& dst) {
+    const std::size_t len = src.len;
+    OwnedColumn out = OwnedColumn::make(Type::STR, len);
+    auto* codes = reinterpret_cast<std::int32_t*>(out.mutable_data());
+    const auto* src_codes = reinterpret_cast<const std::int32_t*>(src.data);
+    for (std::size_t p = 0; p < len; ++p) {
+        const bool valid = src.all_valid || validity::get_bit(src.validity, p);
+        if (valid)
+            codes[p] = dst.intern(src.dict->at(src_codes[p]));
+        else
+            out.set_null(p);
+    }
+    return out;
+}
+
+// WP-7b: fold one STR value `s` into a per-group MIN/MAX cell. The running extremum
+// is a code in the aggregate's owned dict `dst`, chosen by lexicographic byte VALUE
+// (std::string_view ordering == DuckDB VARCHAR ordering for ASCII), never by code.
+inline void scatter_str_minmax(detail::AggCell& cell, AggFunc func,
+                               std::string_view s, StringDict& dst) {
+    if (cell.cnt == 0) {
+        cell.i = dst.intern(s);
+    } else {
+        const std::string_view cur = dst.at(static_cast<std::int32_t>(cell.i));
+        const bool take = (func == AggFunc::Min) ? (s < cur) : (s > cur);
+        if (take) cell.i = dst.intern(s);
+    }
+    ++cell.cnt;
+}
+
 }  // namespace
 
 void Aggregate::open() {
@@ -144,6 +196,7 @@ void Aggregate::open() {
     opened_ = true;
     state_ = std::make_shared<State>();
     State& st = *state_;
+    st.str_dict = std::make_shared<StringDict>();  // WP-7b owned canonical dict
 
     // Resolve per-agg input types / float-ness and the key types.
     st.input_types.reserve(aggs_.size());
@@ -183,6 +236,7 @@ void Aggregate::drain_and_build() {
 
     std::vector<Column> key_views;        // reused per batch (grouped)
     std::vector<std::uint32_t> gids;      // reused per batch (grouped)
+    std::vector<OwnedColumn> canon_keys;  // WP-7b: per-batch canonical STR keys
 
     while (std::optional<Batch> in = child_->next()) {
         const Batch& b = *in;
@@ -207,6 +261,20 @@ void Aggregate::drain_and_build() {
                     for (std::size_t k = 0; k < n; ++k)
                         if (detail::read_col(col, b.sel, k).valid) ++nn;
                     cell.cnt += nn;
+                    continue;
+                }
+
+                if (col.type == Type::STR) {
+                    // WP-7b: global MIN/MAX(str) — by VALUE into the owned dict.
+                    // (SUM/AVG(str) were rejected by agg_result_type.)
+                    for (std::size_t k = 0; k < n; ++k) {
+                        const detail::ColVal v = detail::read_col(col, b.sel, k);
+                        if (!v.valid) continue;
+                        scatter_str_minmax(
+                            cell, spec.func,
+                            col.dict->at(static_cast<std::int32_t>(v.i)),
+                            *st.str_dict);
+                    }
                     continue;
                 }
 
@@ -287,9 +355,22 @@ void Aggregate::drain_and_build() {
         }
 
         // --- GROUPED scatter ----------------------------------------------------
+        // WP-7b: STR key columns are canonicalized into the owned dict by VALUE
+        // before the frozen HashTable sees them; non-STR keys pass through. canon
+        // is reserved (no reallocation) so the views below stay valid for the call.
         key_views.clear();
         key_views.reserve(key_cols_.size());
-        for (std::uint32_t kc : key_cols_) key_views.push_back(b.cols[kc]);
+        canon_keys.clear();
+        canon_keys.reserve(key_cols_.size());
+        for (std::uint32_t col_idx : key_cols_) {
+            const Column& kcol = b.cols[col_idx];
+            if (kcol.type == Type::STR) {
+                canon_keys.push_back(canonicalize_str_key(kcol, *st.str_dict));
+                key_views.push_back(canon_keys.back().view());
+            } else {
+                key_views.push_back(kcol);
+            }
+        }
         const KeyColumns kc{key_views.data(), key_views.size(), b.sel};
 
         gids.resize(n);
@@ -315,9 +396,21 @@ void Aggregate::drain_and_build() {
                 continue;
             }
             const Column& col = b.cols[spec.input_col];
+            const bool str_minmax =
+                col.type == Type::STR &&
+                (spec.func == AggFunc::Min || spec.func == AggFunc::Max);
             for (std::size_t k = 0; k < n; ++k) {
                 const detail::ColVal v = detail::read_col(col, b.sel, k);
-                scatter_row(cells[gids[k]], spec.func, isf, v);
+                if (str_minmax) {
+                    // WP-7b: MIN/MAX(str) compare by VALUE via the source dict.
+                    if (!v.valid) continue;
+                    scatter_str_minmax(
+                        cells[gids[k]], spec.func,
+                        col.dict->at(static_cast<std::int32_t>(v.i)),
+                        *st.str_dict);
+                } else {
+                    scatter_row(cells[gids[k]], spec.func, isf, v);
+                }
             }
         }
     }
@@ -339,6 +432,7 @@ std::optional<Batch> Aggregate::next() {
             OwnedColumn c = OwnedColumn::make(rt, 1);
             detail::write_agg_cell(c, 0, aggs_[a].func, st.is_float[a], rt,
                                    st.cells_global[a]);
+            if (rt == Type::STR) c.set_dict(st.str_dict);  // WP-7b MIN/MAX(str)
             out.add_column(std::move(c));
         }
         current_ = std::move(out);
@@ -361,6 +455,7 @@ std::optional<Batch> Aggregate::next() {
             detail::write_key_cell(c, r, kt, st.ht->group_is_null(g, j),
                                    st.ht->group_key_word(g, j));
         }
+        if (kt == Type::STR) c.set_dict(st.str_dict);  // WP-7b STR group key
         out.add_column(std::move(c));
     }
     // Aggregate result columns.
@@ -370,6 +465,7 @@ std::optional<Batch> Aggregate::next() {
         for (std::size_t r = 0; r < m; ++r)
             detail::write_agg_cell(c, r, aggs_[a].func, st.is_float[a], rt,
                                    st.cells_grp[a][emit_cursor_ + r]);
+        if (rt == Type::STR) c.set_dict(st.str_dict);  // WP-7b MIN/MAX(str)
         out.add_column(std::move(c));
     }
 

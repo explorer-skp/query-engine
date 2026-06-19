@@ -215,6 +215,8 @@ TEST_CASE("scalar==vector: cast, every meaningful (from,to) pair, boundary lens"
                             static_cast<std::int64_t*>(ip)[i] =
                                 static_cast<std::int64_t>(rng());
                             break;
+                        case Type::STR:
+                            break;  // WP-7b: STR excluded from the cast type matrix
                         case Type::F64: {
                             // integer-valued + simple half fractions + some OOR,
                             // avoiding ULP-half pathologies so round-half-away is

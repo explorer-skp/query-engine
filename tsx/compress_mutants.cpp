@@ -242,6 +242,8 @@ std::optional<Batch> CompressedScan::next() {
             case Type::BOOL:
                 decode_bool_window(e, cc, oc, start, n);
                 break;
+            case Type::STR:  // WP-7b: STR out of compression grammar (mutant path)
+                break;
         }
         out.add_column(std::move(oc));
     }

@@ -26,6 +26,7 @@ const char* type_name(Type t) {
         case Type::F64: return "F64";
         case Type::BOOL: return "BOOL";
         case Type::TS: return "TS";
+        case Type::STR: return "STR";
     }
     return "?";
 }

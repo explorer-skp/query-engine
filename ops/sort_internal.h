@@ -14,9 +14,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string_view>
 #include <vector>
 
 #include "core/column.h"
+#include "core/string_dict.h"
 #include "core/owned_batch.h"
 #include "core/types.h"
 #include "ops/operator.h"
@@ -34,6 +37,11 @@ struct MaterializedColumns {
     std::vector<Type> types;
     std::vector<std::vector<std::byte>> data;       // [col] -> n*width bytes
     std::vector<std::vector<std::uint8_t>> valid;   // [col] -> n flags (1=valid)
+    // WP-7b: per-column OWNED canonical dict for STR columns (nullptr otherwise).
+    // The child's batches (and their dicts) are released after the drain, so STR
+    // values are re-interned by VALUE here; the stored 4-byte codes index THESE
+    // dicts (also making codes consistent across batches with different src dicts).
+    std::vector<std::shared_ptr<StringDict>> dicts;
     std::size_t n = 0;
 
     std::size_t num_rows() const { return n; }
@@ -41,6 +49,17 @@ struct MaterializedColumns {
 
     bool is_valid(std::size_t col, std::size_t row) const {
         return valid[col][row] != 0;
+    }
+
+    // WP-7b: the string VALUE at (col,row) of a STR column (resolved code->bytes
+    // via the owned dict). The comparison path orders STR keys by this, never by
+    // raw code. Precondition: types[col]==STR and the row is valid.
+    std::string_view str_at(std::size_t col, std::size_t row) const {
+        const auto code = reinterpret_cast<const std::int32_t*>(data[col].data())[row];
+        return dicts[col]->at(code);
+    }
+    const std::shared_ptr<StringDict>& col_dict(std::size_t col) const {
+        return dicts[col];
     }
 
     // Read an integer-family value (I32/I64/TS/BOOL) at (col,row) as int64. The

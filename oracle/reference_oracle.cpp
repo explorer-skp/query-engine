@@ -17,9 +17,12 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "core/string_dict.h"
 #include "core/validity.h"
 #include "expr/expr.h"
 #include "ops/aggregate.h"
@@ -49,6 +52,9 @@ Cell read_dense(const OwnedColumn& oc, std::size_t r) {
             break;
         case Type::F64:
             cell.f = reinterpret_cast<const double*>(c.data)[r];
+            break;
+        case Type::STR:
+            cell.s = c.dict->at(reinterpret_cast<const std::int32_t*>(c.data)[r]);
             break;
     }
     return cell;
@@ -81,15 +87,36 @@ Num read_num(const Column& c, std::size_t r) {
         case Type::F64:
             n.d = reinterpret_cast<const double*>(c.data)[r];
             break;
+        case Type::STR:
+            break;  // WP-7b: STR aggs are read as strings, never as a Num
     }
     return n;
 }
 
-// One key-column word for grouping: (is_null, canonical 64-bit pattern). NULLs
-// compare equal (kEqual); F64 zero -> +0.0 bits to match the engine's read-back.
-std::pair<bool, std::uint64_t> key_word(const Column& c, std::size_t r, Type t) {
+// One key-column value for grouping/joining. NULLs compare equal (kEqual); F64
+// zero -> +0.0 bits to match the engine's read-back. WP-7b: a STR key carries its
+// string VALUE in `s` (codes are dict-relative and incomparable across columns),
+// so equal strings group/join together; numeric keys leave `s` empty. RefKey has a
+// total order + equality so it works directly as a std::map key element.
+struct RefKey {
+    bool is_null = false;
+    std::uint64_t w = 0;
+    std::string s;
+    bool operator<(const RefKey& o) const {
+        return std::tie(is_null, w, s) < std::tie(o.is_null, o.w, o.s);
+    }
+    bool operator==(const RefKey& o) const {
+        return is_null == o.is_null && w == o.w && s == o.s;
+    }
+};
+
+RefKey key_word(const Column& c, std::size_t r, Type t) {
     const bool valid = c.all_valid || validity::get_bit(c.validity, r);
-    if (!valid) return {true, 0};
+    if (!valid) return {true, 0, {}};
+    if (t == Type::STR) {
+        const auto code = reinterpret_cast<const std::int32_t*>(c.data)[r];
+        return {false, 0, std::string(c.dict->at(code))};
+    }
     std::uint64_t w = 0;
     switch (t) {
         case Type::I32: {
@@ -116,17 +143,24 @@ std::pair<bool, std::uint64_t> key_word(const Column& c, std::size_t r, Type t) 
             }
             break;
         }
+        case Type::STR:
+            break;  // handled above (returns the string value)
     }
-    return {false, w};
+    return {false, w, {}};
 }
 
-// Decode a (canonical) key word back into an output Cell of type t.
-Cell decode_key(bool is_null, std::uint64_t w, Type t) {
+// Decode a (canonical) RefKey back into an output Cell of type t.
+Cell decode_key(const RefKey& k, Type t) {
     Cell c;
-    if (is_null) {
+    if (k.is_null) {
         c.is_null = true;
         return c;
     }
+    if (t == Type::STR) {
+        c.s = k.s;  // WP-7b
+        return c;
+    }
+    const std::uint64_t w = k.w;
     switch (t) {
         case Type::I32:
             c.i = static_cast<std::int32_t>(static_cast<std::uint32_t>(w));
@@ -141,6 +175,8 @@ Cell decode_key(bool is_null, std::uint64_t w, Type t) {
         case Type::BOOL:
             c.i = static_cast<std::int64_t>(w & 1ull);
             break;
+        case Type::STR:
+            break;  // handled above (returns the string value)
         case Type::F64: {
             double v;
             std::memcpy(&v, &w, 8);
@@ -151,11 +187,13 @@ Cell decode_key(bool is_null, std::uint64_t w, Type t) {
     return c;
 }
 
-// Per-group, per-agg accumulator (independent of the engine's AggCell).
+// Per-group, per-agg accumulator (independent of the engine's AggCell). WP-7b:
+// `s` holds the running MIN/MAX string for a STR aggregate (by VALUE).
 struct Acc {
     std::int64_t i = 0;
     double d = 0.0;
     std::int64_t cnt = 0;
+    std::string s;
 };
 
 Acc init_acc(AggFunc f) {
@@ -191,7 +229,7 @@ ResultSet run_reference_group_by(const Table& table, const LogicalQuery& q) {
     }
 
     // Group accumulators, in first-seen order; keyed by canonical key tuple.
-    using KeyTuple = std::vector<std::pair<bool, std::uint64_t>>;
+    using KeyTuple = std::vector<RefKey>;  // WP-7b: RefKey carries STR values
     std::map<KeyTuple, std::size_t> index;
     std::vector<KeyTuple> group_keys;
     std::vector<std::vector<Acc>> group_acc;  // [group][agg]
@@ -253,6 +291,29 @@ ResultSet run_reference_group_by(const Table& table, const LogicalQuery& q) {
                 ++acc.cnt;
                 continue;
             }
+            if (in_type[a] == Type::STR) {
+                // WP-7b: STR aggregates are COUNT / MIN / MAX by string VALUE
+                // (SUM/AVG(str) are rejected upstream by agg_result_type).
+                const Column& col = full.cols[spec.input_col];
+                const bool valid =
+                    col.all_valid || validity::get_bit(col.validity, r);
+                if (!valid) continue;
+                if (spec.func == AggFunc::Count) {
+                    ++acc.cnt;
+                    continue;
+                }
+                const auto code =
+                    reinterpret_cast<const std::int32_t*>(col.data)[r];
+                std::string sv(col.dict->at(code));
+                if (acc.cnt == 0)
+                    acc.s = sv;
+                else if (spec.func == AggFunc::Min)
+                    acc.s = std::min(acc.s, sv);
+                else  // Max
+                    acc.s = std::max(acc.s, sv);
+                ++acc.cnt;
+                continue;
+            }
             const Num v = read_num(full.cols[spec.input_col], r);
             switch (spec.func) {
                 case AggFunc::Count:
@@ -298,8 +359,7 @@ ResultSet run_reference_group_by(const Table& table, const LogicalQuery& q) {
         row.reserve(gb.keys.size() + gb.aggs.size());
         for (std::size_t j = 0; j < gb.keys.size(); ++j) {
             const Type kt = table.schema().fields[gb.keys[j]].second;
-            row.push_back(
-                decode_key(group_keys[g][j].first, group_keys[g][j].second, kt));
+            row.push_back(decode_key(group_keys[g][j], kt));
         }
         for (std::size_t a = 0; a < gb.aggs.size(); ++a) {
             const AggSpec& spec = gb.aggs[a];
@@ -325,6 +385,8 @@ ResultSet run_reference_group_by(const Table& table, const LogicalQuery& q) {
                         c.is_null = true;
                     else if (rt == Type::F64)
                         c.f = acc.d;
+                    else if (rt == Type::STR)
+                        c.s = acc.s;  // WP-7b
                     else
                         c.i = acc.i;
                     break;
@@ -366,6 +428,8 @@ void apply_order_by(ResultSet& rs, const std::vector<SortKey>& keys) {
                 int cmp;
                 if (rs.types[k.col] == Type::F64)
                     cmp = (ca.f < cb.f) ? -1 : (ca.f > cb.f) ? 1 : 0;
+                else if (rs.types[k.col] == Type::STR)
+                    cmp = ca.s.compare(cb.s);  // WP-7b: by value
                 else
                     cmp = (ca.i < cb.i) ? -1 : (ca.i > cb.i) ? 1 : 0;
                 if (cmp != 0)
@@ -454,6 +518,9 @@ Cell read_cell_col(const Column& c, std::size_t r) {
         case Type::F64:
             cell.f = reinterpret_cast<const double*>(c.data)[r];
             break;
+        case Type::STR:
+            cell.s = c.dict->at(reinterpret_cast<const std::int32_t*>(c.data)[r]);
+            break;
     }
     return cell;
 }
@@ -474,7 +541,7 @@ ResultSet run_join_reference(const Table& probe, const Table& build,
 
     // Canonical key tuple of a row, or std::nullopt if ANY key column is NULL
     // (kNeverMatch: a NULL key never matches, not even another NULL).
-    using KeyTuple = std::vector<std::uint64_t>;
+    using KeyTuple = std::vector<RefKey>;  // WP-7b: RefKey matches STR by value
     auto key_of = [&](const Batch& b, const std::vector<std::uint32_t>& keys,
                       const Schema& sch, std::size_t r)
         -> std::optional<KeyTuple> {
@@ -482,10 +549,9 @@ ResultSet run_join_reference(const Table& probe, const Table& build,
         kt.reserve(nk);
         for (std::size_t j = 0; j < nk; ++j) {
             const std::uint32_t kc = keys[j];
-            const auto [is_null, w] =
-                key_word(b.cols[kc], r, sch.fields[kc].second);
-            if (is_null) return std::nullopt;  // dead key, never matches
-            kt.push_back(w);
+            const RefKey rk = key_word(b.cols[kc], r, sch.fields[kc].second);
+            if (rk.is_null) return std::nullopt;  // dead key, never matches
+            kt.push_back(rk);
         }
         return kt;
     };
@@ -558,6 +624,7 @@ RefTime read_time_ref(const Column& c, std::size_t r) {
             break;
         case Type::F64:
         case Type::BOOL:
+        case Type::STR:
             out.valid = false;  // not a valid timestamp type
             break;
     }
@@ -584,7 +651,7 @@ ResultSet run_asof_reference(const Table& probe, const Table& build,
 
     // Canonical key tuple of a row, or nullopt if ANY key column is NULL (a NULL
     // key never matches — same canonicalization as group_by/join above).
-    using KeyTuple = std::vector<std::uint64_t>;
+    using KeyTuple = std::vector<RefKey>;  // WP-7b: RefKey (numeric keys here)
     auto key_of = [&](const Batch& b, const std::vector<std::uint32_t>& keys,
                       const Schema& sch,
                       std::size_t r) -> std::optional<KeyTuple> {
@@ -592,9 +659,9 @@ ResultSet run_asof_reference(const Table& probe, const Table& build,
         kt.reserve(nk);
         for (std::size_t j = 0; j < nk; ++j) {
             const std::uint32_t kc = keys[j];
-            const auto [is_null, w] = key_word(b.cols[kc], r, sch.fields[kc].second);
-            if (is_null) return std::nullopt;
-            kt.push_back(w);
+            const RefKey rk = key_word(b.cols[kc], r, sch.fields[kc].second);
+            if (rk.is_null) return std::nullopt;
+            kt.push_back(rk);
         }
         return kt;
     };
@@ -761,7 +828,7 @@ ResultSet run_window_reference(const Table& input, qe::tsx::WindowMode mode,
         for (std::size_t a = 0; a < aggs.size(); ++a)
             rs.types.push_back(agg_result_type(aggs[a].func, in_type[a]));
 
-        using KeyTuple = std::vector<std::pair<bool, std::uint64_t>>;
+        using KeyTuple = std::vector<RefKey>;  // WP-7b
         std::map<KeyTuple, std::size_t> index;
         std::vector<KeyTuple> group_keys;
         std::vector<std::vector<Acc>> group_acc;  // [group][agg]
@@ -829,11 +896,9 @@ ResultSet run_window_reference(const Table& input, qe::tsx::WindowMode mode,
             std::vector<Cell> row;
             row.reserve(keys.size() + 1 + aggs.size());
             for (std::size_t j = 0; j < keys.size(); ++j)
-                row.push_back(decode_key(group_keys[g][j].first,
-                                         group_keys[g][j].second,
-                                         cs.fields[keys[j]].second));
-            row.push_back(decode_key(group_keys[g][keys.size()].first,
-                                     group_keys[g][keys.size()].second, ttype));
+                row.push_back(
+                    decode_key(group_keys[g][j], cs.fields[keys[j]].second));
+            row.push_back(decode_key(group_keys[g][keys.size()], ttype));
             for (std::size_t a = 0; a < aggs.size(); ++a)
                 row.push_back(finalize_acc(aggs[a], group_acc[g][a], in_type[a],
                                            is_float[a], group_acc[g][a].cnt));
@@ -849,7 +914,7 @@ ResultSet run_window_reference(const Table& input, qe::tsx::WindowMode mode,
         rs.types.push_back(agg_result_type(aggs[a].func, in_type[a]));
 
     // Partition rows by the canonical key tuple (kEqual: NULLs group together).
-    using KeyTuple = std::vector<std::pair<bool, std::uint64_t>>;
+    using KeyTuple = std::vector<RefKey>;  // WP-7b
     std::map<KeyTuple, std::vector<std::size_t>> parts;
     for (std::size_t r = 0; r < n; ++r) {
         KeyTuple kt;
@@ -934,7 +999,13 @@ Table rs_to_table(const ResultSet& rs, const Schema& schema) {
     cols.reserve(schema.fields.size());
     for (std::size_t c = 0; c < schema.fields.size(); ++c) {
         const Type t = schema.fields[c].second;
-        OwnedColumn oc = OwnedColumn::make(t, n);
+        // WP-7b: STR intermediates re-intern their string VALUES into a fresh dict
+        // owned by this rebuilt column (the codes index it).
+        std::shared_ptr<StringDict> dict;
+        OwnedColumn oc =
+            (t == Type::STR)
+                ? OwnedColumn::make_str(n, (dict = std::make_shared<StringDict>()))
+                : OwnedColumn::make(t, n);
         std::byte* d = oc.mutable_data();
         for (std::size_t r = 0; r < n; ++r) {
             const Cell& cell = rs.rows[r][c];
@@ -957,6 +1028,9 @@ Table rs_to_table(const ResultSet& rs, const Schema& schema) {
                     break;
                 case Type::F64:
                     reinterpret_cast<double*>(d)[r] = cell.f;
+                    break;
+                case Type::STR:
+                    reinterpret_cast<std::int32_t*>(d)[r] = dict->intern(cell.s);
                     break;
             }
         }

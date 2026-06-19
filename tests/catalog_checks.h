@@ -41,4 +41,7 @@ Verdict compress_decode_drift();
 // parallel execution (tests/catalog_checks_parallel.cpp) — WP-10b
 Verdict parallel_merge_drop_partial();
 
+// dictionary-encoded VARCHAR join keys (tests/catalog_checks_strings.cpp) — WP-7b
+Verdict string_key_by_code();
+
 }  // namespace qe::catalog::checks

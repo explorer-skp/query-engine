@@ -79,6 +79,10 @@ bool less_row(const sd::MaterializedColumns& mat, const std::vector<SortKey>& ke
             const double fa = mat.f64_at(c, a);
             const double fb = mat.f64_at(c, b);
             cmp = (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
+        } else if (mat.types[c] == Type::STR) {
+            // WP-7b: order STR by VALUE (lexicographic bytes via the owned dict),
+            // never by raw code. std::string_view ordering == DuckDB VARCHAR ASCII.
+            cmp = mat.str_at(c, a).compare(mat.str_at(c, b));
         } else {
             const std::int64_t ia = mat.int_at(c, a);
             const std::int64_t ib = mat.int_at(c, b);

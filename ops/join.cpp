@@ -23,14 +23,43 @@
 
 #include <algorithm>
 #include <cassert>
+#include <memory>
 #include <utility>
 
 #include "core/selection.h"
+#include "core/string_dict.h"
+#include "core/validity.h"
 #include "ops/join_internal.h"
 
 namespace qe {
 
 namespace detail = qe::ops::detail;
+
+namespace {
+
+// WP-7b: canonicalize one STR join-key column into a dense-by-physical-layout I32
+// column of VALUE ids drawn from `idmap` (a dict shared between the build and probe
+// sides for this key position). Equal string VALUES across the two sides' different
+// dictionaries therefore get the SAME id, so the frozen HashTable — fed these I32
+// ids in place of STR — matches by value. Feeding the raw codes instead (the
+// planted mutant) misses every cross-dictionary match. Validity is preserved (a
+// NULL key stays NULL -> NullPolicy::kNeverMatch, never joins).
+OwnedColumn canonicalize_str_key_to_i32(const Column& src, StringDict& idmap) {
+    const std::size_t len = src.len;
+    OwnedColumn out = OwnedColumn::make(Type::I32, len);
+    auto* ids = reinterpret_cast<std::int32_t*>(out.mutable_data());
+    const auto* codes = reinterpret_cast<const std::int32_t*>(src.data);
+    for (std::size_t p = 0; p < len; ++p) {
+        const bool valid = src.all_valid || validity::get_bit(src.validity, p);
+        if (valid)
+            ids[p] = idmap.intern(src.dict->at(codes[p]));
+        else
+            out.set_null(p);
+    }
+    return out;
+}
+
+}  // namespace
 
 struct HashJoin::State {
     std::unique_ptr<HashTable> ht;
@@ -38,7 +67,13 @@ struct HashJoin::State {
     // Multiplicity map: group id -> list of build-store row indices for that key.
     std::vector<std::vector<std::uint32_t>> group_rows;
 
-    std::vector<Type> build_key_types;
+    std::vector<Type> build_key_types;  // STR positions substituted to I32 (table)
+
+    // WP-7b: per-key-position VALUE->id dict, SHARED between build and probe so
+    // equal strings on both sides canonicalize to the same id. nullptr for non-STR
+    // key positions.
+    std::vector<std::shared_ptr<StringDict>> key_id_maps;
+    std::vector<OwnedColumn> canon_keys;  // per-batch canonical I32 key scratch
 
     // Pair arrays for the CURRENT probe batch: parallel vectors of (physical probe
     // row, build-store row | kNullBuildRow). Rebuilt per probe batch, drained in
@@ -85,10 +120,21 @@ Schema HashJoin::output_schema() const {
 void HashJoin::build_side() {
     State& st = *state_;
 
-    // Key types from the BUILD side (the table is built/probed over these).
+    // Key types from the BUILD side (the table is built/probed over these). WP-7b:
+    // a STR key position is canonicalized to a shared VALUE-id space and fed to the
+    // table as I32, so the table never sees STR keys; allocate that position's
+    // shared id map here (used by both the build inserts and the probe finds).
     st.build_key_types.clear();
-    for (std::uint32_t kc : build_keys_)
-        st.build_key_types.push_back(build_schema_.fields[kc].second);
+    st.key_id_maps.assign(build_keys_.size(), nullptr);
+    for (std::size_t i = 0; i < build_keys_.size(); ++i) {
+        const Type t = build_schema_.fields[build_keys_[i]].second;
+        if (t == Type::STR) {
+            st.key_id_maps[i] = std::make_shared<StringDict>();
+            st.build_key_types.push_back(Type::I32);  // ids in place of STR
+        } else {
+            st.build_key_types.push_back(t);
+        }
+    }
     st.ht = std::make_unique<HashTable>(st.build_key_types,
                                         NullPolicy::kNeverMatch);
 
@@ -108,7 +154,18 @@ void HashJoin::build_side() {
 
         key_views.clear();
         key_views.reserve(build_keys_.size());
-        for (std::uint32_t kc : build_keys_) key_views.push_back(b.cols[kc]);
+        st.canon_keys.clear();
+        st.canon_keys.reserve(build_keys_.size());
+        for (std::size_t i = 0; i < build_keys_.size(); ++i) {
+            const Column& col = b.cols[build_keys_[i]];
+            if (st.key_id_maps[i]) {  // STR -> shared I32 value-ids
+                st.canon_keys.push_back(
+                    canonicalize_str_key_to_i32(col, *st.key_id_maps[i]));
+                key_views.push_back(st.canon_keys.back().view());
+            } else {
+                key_views.push_back(col);
+            }
+        }
         const KeyColumns kc{key_views.data(), key_views.size(), b.sel};
 
         gids.resize(n);
@@ -139,7 +196,18 @@ bool HashJoin::build_pairs_for_probe() {
 
     st.key_views.clear();
     st.key_views.reserve(probe_keys_.size());
-    for (std::uint32_t kc : probe_keys_) st.key_views.push_back(b.cols[kc]);
+    st.canon_keys.clear();
+    st.canon_keys.reserve(probe_keys_.size());
+    for (std::size_t i = 0; i < probe_keys_.size(); ++i) {
+        const Column& col = b.cols[probe_keys_[i]];
+        if (st.key_id_maps[i]) {  // STR -> SAME shared I32 value-ids as the build
+            st.canon_keys.push_back(
+                canonicalize_str_key_to_i32(col, *st.key_id_maps[i]));
+            st.key_views.push_back(st.canon_keys.back().view());
+        } else {
+            st.key_views.push_back(col);
+        }
+    }
     const KeyColumns kc{st.key_views.data(), st.key_views.size(), b.sel};
 
     st.gids.resize(n);

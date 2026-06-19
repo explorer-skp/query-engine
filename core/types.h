@@ -10,7 +10,12 @@
 
 namespace qe {
 
-enum class Type { I32, I64, F64, BOOL, TS };  // TS = int64 ns since epoch
+// WP-7b (pre-authorized ICR-1, additive): STR appended AFTER TS — existing
+// enumerators are byte-unchanged. STR = dictionary-encoded VARCHAR: the column's
+// `data` holds int32 dictionary codes (byte_width(STR)==4), resolved to bytes by
+// the out-of-band StringDict referenced from the Column view (core/string_dict.h).
+// Equality/order is by string VALUE (resolved bytes), never by raw code.
+enum class Type { I32, I64, F64, BOOL, TS, STR };  // TS = int64 ns since epoch
 
 // Physical width, in bytes, of one stored value of `t` in a Column's `data`
 // buffer. This fixes the in-memory layout every later WP relies on:
@@ -36,6 +41,8 @@ inline constexpr std::size_t byte_width(Type t) {
             return 1;
         case Type::TS:
             return 8;
+        case Type::STR:
+            return 4;  // int32 dictionary code (see Type::STR note above)
     }
     return 0;  // unreachable; all enumerators handled above
 }

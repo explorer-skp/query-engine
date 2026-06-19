@@ -26,8 +26,10 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <string>
 #include <vector>
 
+#include "core/owned_batch.h"
 #include "oracle/logical_query.h"
 #include "ops/table.h"
 #include "plan/plan.h"
@@ -136,6 +138,16 @@ Schema gen_schema(std::mt19937_64& rng, const GenConfig& cfg = {});
 // finite floats, ~null_pct% nulls).
 Table gen_table(std::mt19937_64& rng, const Schema& schema,
                 const GenConfig& cfg = {});
+
+// WP-7b: a dictionary-encoded VARCHAR (Type::STR) column of `n` rows, each a random
+// pick from `alphabet` (a small set of short ASCII strings, no embedded NULs),
+// interned into a FRESH per-column dict, with ~null_pct% nulls. Two columns built
+// from the same alphabet share the string VALUES but generally get DIFFERENT codes
+// (first-use order differs) — the cross-dictionary case STR equality/join/group/sort
+// must resolve by VALUE, never by raw code.
+OwnedColumn gen_string_column(std::mt19937_64& rng,
+                              const std::vector<std::string>& alphabet,
+                              std::size_t n, int null_pct);
 
 // Generate a LogicalQuery (optional BOOL filter + 1..4 named projections) over
 // `schema`, within the divergence-safe grammar described above.

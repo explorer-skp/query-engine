@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "core/column.h"
+#include "core/string_dict.h"
 #include "core/validity.h"
 #include "duckdb.hpp"
 #include "oracle/plan_sql.h"
@@ -48,6 +49,20 @@ std::string cell_literal(const OwnedColumn& oc, std::size_t r) {
             os.precision(17);
             os << reinterpret_cast<const double*>(c.data)[r];
             break;
+        case Type::STR: {
+            // WP-7b: decode the dict code to its bytes and emit a single-quoted SQL
+            // string literal (doubling embedded quotes) so DuckDB sees the real
+            // TEXT, not the code. Generators emit ASCII without embedded NULs.
+            const auto code = reinterpret_cast<const std::int32_t*>(c.data)[r];
+            const std::string_view sv = c.dict->at(code);
+            os << '\'';
+            for (const char ch : sv) {
+                if (ch == '\'') os << "''";
+                else os << ch;
+            }
+            os << '\'';
+            break;
+        }
     }
     return os.str();
 }
@@ -106,6 +121,9 @@ Cell read_value(const duckdb::Value& v, Type t) {
             break;
         case Type::F64:
             cell.f = v.GetValue<double>();
+            break;
+        case Type::STR:
+            cell.s = v.GetValue<std::string>();  // WP-7b: VARCHAR text by value
             break;
     }
     return cell;

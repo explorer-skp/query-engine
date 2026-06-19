@@ -61,6 +61,11 @@ void cmp_scalar(CmpOp op, Type t, const void* a, const void* b,
             cmp_t<std::uint8_t>(op, static_cast<const std::uint8_t*>(a),
                                 static_cast<const std::uint8_t*>(b), out, n);
             break;
+        case Type::STR:
+            // WP-7b: STR compares by VALUE through the dicts and is handled in
+            // eval.cpp::cmp_str BEFORE the numeric kernels; it never reaches here
+            // (raw codes would be the planted "compare by code" bug). Unreachable.
+            break;
     }
 }
 

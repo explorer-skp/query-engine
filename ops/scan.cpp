@@ -39,6 +39,11 @@ std::optional<Batch> Scan::next() {
         view.type = oc.type();
         view.len = n;
         view.data = oc.data() + start * byte_width(oc.type());
+        // WP-7b: carry the STR dictionary into the batch view (nullptr for non-STR).
+        // The Table owns the dict for its whole lifetime, so this raw pointer stays
+        // valid for every batch the scan emits. (This view is hand-built here rather
+        // than via OwnedColumn::view(), so the dict must be copied explicitly.)
+        view.dict = oc.dict();
         if (oc.all_valid()) {
             // Fast path: no nulls in the whole column => none in this window.
             view.validity = nullptr;

@@ -24,6 +24,11 @@
 
 namespace qe {
 
+// Forward declaration: the out-of-band code->bytes table for Type::STR columns.
+// Defined in the sibling helper header core/string_dict.h (a helper TYPE, which
+// the frozen contract permits). The Column view only needs the pointer.
+class StringDict;
+
 // A view over one contiguous, type-width column of `len` values.
 //
 //   data:     `len * byte_width(type)` contiguous bytes (see core/types.h for
@@ -53,6 +58,12 @@ struct Column {
     const std::byte* data;     // contiguous, type-width
     const uint64_t* validity;  // nullptr => no nulls present (implies all_valid)
     bool all_valid;            // fast-path flag; true => no nulls, ignore validity
+    // WP-7b (pre-authorized ICR-2, additive field appended after all_valid —
+    // existing fields byte-unchanged). Non-null IFF type==STR: resolves the int32
+    // dictionary codes in `data` to their string bytes. nullptr for every non-STR
+    // column. The pointed-at StringDict is owned elsewhere (the source OwnedColumn
+    // / operator state) and must outlive this view, exactly like `data`/`validity`.
+    const StringDict* dict;
 };
 
 // Optional per-batch selection vector (decision D6): an ordered list of physical

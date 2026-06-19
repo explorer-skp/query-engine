@@ -44,6 +44,17 @@ std::uint64_t normalize_value(Type t, const std::byte* p) {
             if (d == 0.0) return 0ull;  // collapses -0.0 and +0.0
             return std::bit_cast<std::uint64_t>(d);
         }
+        case Type::STR:
+            // WP-7b: the int32 dictionary CODE, zero-extended (same as I32). This
+            // groups by code, which is correct ONLY when one dict spans the whole
+            // key column (GROUP BY on a scanned STR column — codes are consistent
+            // and dedup'd). Across DIFFERENT dicts (a JOIN's build vs probe side),
+            // codes are NOT comparable; the join operator therefore canonicalizes
+            // STR keys to a shared value-id space (Type::I32) BEFORE the table, so
+            // STR never reaches here in a join. Hashing a join's raw STR codes is
+            // exactly the planted "by code not by value" mutant.
+            return static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(load_as<std::int32_t>(p)));
     }
     return 0ull;  // unreachable; all Types handled
 }

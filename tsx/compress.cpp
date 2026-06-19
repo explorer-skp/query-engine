@@ -122,6 +122,9 @@ std::uint64_t read_bits(const OwnedColumn& oc, std::size_t r) {
         }
         case Type::BOOL:
             return reinterpret_cast<const std::uint8_t*>(d)[r] ? 1ull : 0ull;
+        case Type::STR:  // WP-7b: STR is out of the compression grammar
+            assert(false && "STR is not a compressible column type");
+            return 0;
     }
     return 0;
 }
@@ -230,6 +233,9 @@ EncodedColumn encode_column(const OwnedColumn& oc) {
             break;
         case Type::BOOL:
             encode_bool(vals, e.values);
+            break;
+        case Type::STR:  // WP-7b: STR is out of the compression grammar
+            assert(false && "STR is not a compressible column type");
             break;
     }
     return e;
@@ -456,6 +462,9 @@ std::optional<Batch> CompressedScan::next() {
                 break;
             case Type::BOOL:
                 decode_bool_window(e, cc, oc, start, n);
+                break;
+            case Type::STR:  // WP-7b: STR is out of the compression grammar
+                assert(false && "STR is not a compressible column type");
                 break;
         }
         out.add_column(std::move(oc));

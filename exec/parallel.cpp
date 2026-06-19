@@ -116,7 +116,13 @@ Table result_set_to_table(const ResultSet& rs, const Schema& schema) {
     cols.reserve(schema.fields.size());
     for (std::size_t c = 0; c < schema.fields.size(); ++c) {
         const Type t = schema.fields[c].second;
-        OwnedColumn oc = OwnedColumn::make(t, n);
+        // WP-7b: STR intermediates re-intern their string VALUES into a fresh dict
+        // owned by this rebuilt column (the codes index it).
+        std::shared_ptr<StringDict> dict;
+        OwnedColumn oc =
+            (t == Type::STR)
+                ? OwnedColumn::make_str(n, (dict = std::make_shared<StringDict>()))
+                : OwnedColumn::make(t, n);
         std::byte* data = oc.mutable_data();
         for (std::size_t r = 0; r < n; ++r) {
             const Cell& cell = rs.rows[r][c];
@@ -139,6 +145,10 @@ Table result_set_to_table(const ResultSet& rs, const Schema& schema) {
                 case Type::BOOL:
                     reinterpret_cast<std::uint8_t*>(data)[r] =
                         (!cell.is_null && cell.i) ? 1 : 0;
+                    break;
+                case Type::STR:
+                    reinterpret_cast<std::int32_t*>(data)[r] =
+                        cell.is_null ? 0 : dict->intern(cell.s);
                     break;
             }
             if (cell.is_null) oc.set_null(r);

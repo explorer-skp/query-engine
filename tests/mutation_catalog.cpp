@@ -86,6 +86,9 @@ std::vector<Entry> build_catalog() {
         {"parallel_merge_drop_partial", Hazard::kOperatorOrchestration,
          "mutant::ParallelEngine{kMergeDropPartial}", "wp10b_parallel_mutation_test",
          ck::parallel_merge_drop_partial},
+        {"string_key_by_code", Hazard::kOperatorOrchestration,
+         "mutant::StringKeyJoin{kHashRawCode}", "wp7b_strings_mutation_test",
+         ck::string_key_by_code},
     };
 }
 

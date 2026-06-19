@@ -120,7 +120,9 @@ void arith_scalar(ArithOp op, Type t, const void* a, const void* b, void* out,
             break;
         case Type::BOOL:
         case Type::TS:
-            // Builder never produces arithmetic on these (cast required first).
+        case Type::STR:
+            // Builder never produces arithmetic on these (STR arith is a build-time
+            // type error in expr.cpp::arith; TS/BOOL require an explicit cast).
             break;
     }
 }

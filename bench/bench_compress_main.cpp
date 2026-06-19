@@ -97,6 +97,7 @@ const char* type_name(Type t) {
         case Type::F64: return "f64";
         case Type::BOOL: return "bool";
         case Type::TS: return "ts";
+        case Type::STR: return "str";
     }
     return "?";
 }

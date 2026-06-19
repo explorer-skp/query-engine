@@ -39,6 +39,7 @@ std::pair<bool, std::uint64_t> cell_bits(const Column& c, std::size_t r) {
     if (!valid) return {false, 0};
     switch (c.type) {
         case Type::I32:
+        case Type::STR:  // WP-7b: not exercised here; treat the code as 32 bits
             return {true, static_cast<std::uint64_t>(static_cast<std::uint32_t>(
                               reinterpret_cast<const std::int32_t*>(c.data)[r]))};
         case Type::I64:

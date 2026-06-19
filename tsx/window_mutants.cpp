@@ -115,6 +115,8 @@ detail::ColVal store_val(const detail::BuildStore& s, std::uint32_t col,
         case Type::F64:
             r.d = reinterpret_cast<const double*>(d)[row];
             break;
+        case Type::STR:  // WP-7b: STR out of window grammar (mutant path)
+            break;
     }
     return r;
 }

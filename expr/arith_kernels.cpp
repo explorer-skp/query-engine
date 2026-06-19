@@ -155,7 +155,8 @@ void ArithImpl(ArithOp op, Type t, const void* a, const void* b, void* out,
         case Type::F64: DispatchT<double>(op, a, b, out, n); break;
         case Type::BOOL:
         case Type::TS:
-            break;  // builder never produces arithmetic on these
+        case Type::STR:
+            break;  // builder never produces arithmetic on these (STR rejected)
     }
 }
 

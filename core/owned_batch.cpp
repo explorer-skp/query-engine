@@ -22,6 +22,13 @@ OwnedColumn OwnedColumn::make(Type type, std::size_t len) {
     return c;
 }
 
+OwnedColumn OwnedColumn::make_str(std::size_t len,
+                                  std::shared_ptr<const StringDict> dict) {
+    OwnedColumn c = make(Type::STR, len);  // len int32 codes
+    c.dict_ = std::move(dict);
+    return c;
+}
+
 void OwnedColumn::ensure_validity() {
     if (!validity_.empty() || len_ == 0) return;
     validity_ = Buffer(validity::words(len_) * sizeof(std::uint64_t));
@@ -54,6 +61,8 @@ Column OwnedColumn::view() const {
     // Precedence (core/column.h): expose the bitmap only when there are nulls.
     c.all_valid = all_valid_;
     c.validity = all_valid_ ? nullptr : validity();
+    // WP-7b: publish the dict (nullptr for non-STR, where dict_ is never set).
+    c.dict = dict_.get();
     return c;
 }
 
@@ -92,6 +101,12 @@ Batch OwnedBatch::view() const {
 OwnedColumn compact_column(const Column& in, const SelectionVector* sel,
                            std::size_t n) {
     OwnedColumn out = OwnedColumn::make(in.type, n);
+    // WP-7b: STR compaction gathers the int32 codes (byte_width 4 -> the `case 4`
+    // gather below) UNCHANGED, so they stay valid in the SAME dict; carry that dict
+    // pointer through (referenced, not copied — it is owned upstream and outlives
+    // this result like in.data does). Set before the n==0 early return so an empty
+    // STR result still carries its dict.
+    if (in.type == Type::STR) out.set_dict_ref(in.dict);
 
     // n==0 (a 0-row selection or an empty input column): a 0-length result is the
     // right answer — a valid, dense, all-valid EMPTY OwnedColumn of `in.type`. We

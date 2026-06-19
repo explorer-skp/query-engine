@@ -87,6 +87,7 @@ TimeVal read_time(const Column& c, std::uint32_t phys) {
             return {true, reinterpret_cast<const std::int64_t*>(c.data)[phys]};
         case Type::F64:
         case Type::BOOL:
+        case Type::STR:  // WP-7b: STR is out of the window grammar (no STR time)
             assert(false && "window timestamp column must be I32/I64/TS");
             return {false, 0};
     }
@@ -106,6 +107,7 @@ void put_time_word(OwnedColumn& c, Type t, std::size_t i, std::int64_t v) {
             break;
         case Type::F64:
         case Type::BOOL:
+        case Type::STR:
             break;  // unreachable for a timestamp column
     }
 }
@@ -163,6 +165,9 @@ detail::ColVal store_val(const detail::BuildStore& s, std::uint32_t col,
             break;
         case Type::F64:
             r.d = reinterpret_cast<const double*>(d)[row];
+            break;
+        case Type::STR:  // WP-7b: STR aggregation is out of the window grammar
+            assert(false && "window value column must be numeric, not STR");
             break;
     }
     return r;

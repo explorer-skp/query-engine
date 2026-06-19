@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "core/selection.h"
+#include "core/string_dict.h"
 #include "core/validity.h"
 
 namespace qe::oracle {
@@ -35,6 +36,10 @@ Cell read_cell(const Column& c, const SelectionVector* sel, std::size_t k) {
         case Type::F64:
             cell.f = reinterpret_cast<const double*>(c.data)[p];
             break;
+        case Type::STR:
+            // WP-7b: decode the dict code to its bytes — STR is compared by VALUE.
+            cell.s = c.dict->at(reinterpret_cast<const std::int32_t*>(c.data)[p]);
+            break;
     }
     return cell;
 }
@@ -48,6 +53,11 @@ int cell_order(const Cell& a, const Cell& b, Type t) {
         if (a.f < b.f) return -1;
         if (a.f > b.f) return 1;
         return 0;  // equal or both NaN (NaN excluded by WP-3 generators)
+    }
+    if (t == Type::STR) {  // WP-7b: lexicographic by VALUE
+        if (a.s < b.s) return -1;
+        if (a.s > b.s) return 1;
+        return 0;
     }
     if (a.i < b.i) return -1;
     if (a.i > b.i) return 1;
@@ -73,6 +83,7 @@ bool float_eq(double a, double b) {
 
 std::string cell_str(const Cell& c, Type t) {
     if (c.is_null) return "NULL";
+    if (t == Type::STR) return "'" + c.s + "'";  // WP-7b
     std::ostringstream os;
     if (t == Type::F64)
         os << c.f;
@@ -147,6 +158,8 @@ DiffResult compare_result_sets(const ResultSet& engine_in,
             bool same;
             if (e.types[c] == Type::F64)
                 same = float_eq(ec.f, oc.f);
+            else if (e.types[c] == Type::STR)
+                same = ec.s == oc.s;  // WP-7b: exact string value (no tolerance)
             else
                 same = ec.i == oc.i;
             if (!same) {

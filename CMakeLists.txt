@@ -379,6 +379,13 @@ target_link_libraries(qe_aggregate_mutants PUBLIC qe_ops)
 add_library(qe_join_mutants STATIC ops/join_mutants.cpp)
 target_link_libraries(qe_join_mutants PUBLIC qe_ops)
 
+# --- WP-7b: test-only planted mutant of STRING-KEY join wiring. NOT linked into
+# qe_ops / the engine. A faithful copy of the real HashJoin reusing the SAME
+# ops/join_internal.h helpers, whose only defect is hashing/comparing STR keys by
+# raw int32 CODE instead of by VALUE (the §5 by-value-not-by-code hazard).
+add_library(qe_strings_mutants STATIC ops/string_key_mutants.cpp)
+target_link_libraries(qe_strings_mutants PUBLIC qe_ops)
+
 # --- WP-7: test-only planted mutant of the sort operator. NOT linked into any
 # engine target — only the WP-7 mutation self-test. Reuses qe_ops' shared
 # sort_internal helpers (materialize + gather_rows) so the mutant differs from the
@@ -782,6 +789,28 @@ add_test(NAME wp10b_parallel_mutation_test
   COMMAND wp10b_parallel_mutation_test --seed ${QE_CI_SEED})
 set_tests_properties(wp10b_parallel_mutation_test PROPERTIES TIMEOUT 300)
 
+# --- WP-7b: dictionary-encoded VARCHAR (Type::STR) ---------------------------
+# DIFFERENTIAL: string GROUP BY / JOIN / FILTER(=,<) / ORDER BY / MIN-MAX run
+# through the engine == independent reference == DuckDB VARCHAR (when staged).
+# Links qe_oracle (engine + reference + DuckDB + the STR generators).
+add_executable(wp7b_strings_differential_test
+  tests/wp1_test_main.cpp tests/wp7b_strings_differential_test.cpp)
+target_link_libraries(wp7b_strings_differential_test PRIVATE doctest qe_oracle)
+add_test(NAME wp7b_strings_differential_test
+  COMMAND wp7b_strings_differential_test --seed ${QE_CI_SEED})
+set_tests_properties(wp7b_strings_differential_test PROPERTIES TIMEOUT 600)
+
+# MUTATION self-test: the planted by-raw-code STR join (qe_strings_mutants) is
+# CLEAN under kNone and FLAGGED under kHashRawCode on a cross-dictionary join — vs
+# the independent reference (and DuckDB when staged). Proves the diff can fail.
+add_executable(wp7b_strings_mutation_test
+  tests/wp1_test_main.cpp tests/wp7b_strings_mutation_test.cpp)
+target_link_libraries(wp7b_strings_mutation_test
+  PRIVATE doctest qe_oracle qe_strings_mutants)
+add_test(NAME wp7b_strings_mutation_test
+  COMMAND wp7b_strings_mutation_test --seed ${QE_CI_SEED})
+set_tests_properties(wp7b_strings_mutation_test PROPERTIES TIMEOUT 300)
+
 # WP-14 ratio + decode-throughput reporting driver (the §5 "reported" numbers).
 # Mac/NEON numbers are preliminary / relative-only (§2). Links qe_tsx + bench_infra.
 add_executable(bench_compress bench/bench_compress_main.cpp)
@@ -889,6 +918,7 @@ add_executable(mutation_catalog_meta_test
   tests/catalog_checks_window.cpp
   tests/catalog_checks_compress.cpp
   tests/catalog_checks_parallel.cpp
+  tests/catalog_checks_strings.cpp
   tests/catalog_mutants.cpp)
 target_link_libraries(mutation_catalog_meta_test PRIVATE
   doctest
@@ -903,7 +933,8 @@ target_link_libraries(mutation_catalog_meta_test PRIVATE
   qe_asof_mutants
   qe_window_mutants
   qe_compress_mutants
-  qe_parallel_mutants)
+  qe_parallel_mutants
+  qe_strings_mutants)
 add_test(NAME mutation_catalog_meta_test
   COMMAND mutation_catalog_meta_test --seed ${QE_CI_SEED})
 # Runs DuckDB over several queries when staged; generous wall-clock under sanitizers.

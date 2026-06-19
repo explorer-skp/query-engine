@@ -40,11 +40,21 @@ struct BuildStore {
     std::vector<std::vector<std::byte>> data;      // [col] nrows*byte_width(type)
     std::vector<std::vector<std::uint8_t>> valid;  // [col] nrows (1 == valid)
     std::size_t nrows = 0;
+    // WP-7b: per-column OWNED dict for STR columns (nullptr otherwise). The build
+    // child's batches (and their dicts) are released at end-of-build, so STR build
+    // values are re-interned by VALUE into these dicts as rows are appended; the
+    // stored 4-byte codes index THESE dicts, which outlive emit. This also makes
+    // codes consistent even if build batches carried different source dicts.
+    std::vector<std::shared_ptr<StringDict>> col_dicts;
 
     void init(const std::vector<Type>& t) {
         types = t;
         data.assign(t.size(), {});
         valid.assign(t.size(), {});
+        col_dicts.assign(t.size(), nullptr);
+        for (std::size_t c = 0; c < t.size(); ++c)
+            if (t[c] == Type::STR)
+                col_dicts[c] = std::make_shared<StringDict>();
         nrows = 0;
     }
 
@@ -54,16 +64,32 @@ struct BuildStore {
     std::uint32_t append_row(const Batch& b, std::size_t p) {
         for (std::size_t c = 0; c < types.size(); ++c) {
             const Column& col = b.cols[c];
-            const std::size_t w = byte_width(types[c]);
-            const std::byte* src = col.data + static_cast<std::size_t>(p) * w;
-            data[c].insert(data[c].end(), src, src + w);
             const bool v = col.all_valid || validity::get_bit(col.validity, p);
+            if (types[c] == Type::STR) {
+                // Re-intern the string VALUE into this column's owned dict; store
+                // the canonical code (codes from a dead source dict are useless).
+                std::int32_t canon = 0;
+                if (v) {
+                    const auto src_code =
+                        reinterpret_cast<const std::int32_t*>(col.data)[p];
+                    canon = col_dicts[c]->intern(col.dict->at(src_code));
+                }
+                const auto* cb = reinterpret_cast<const std::byte*>(&canon);
+                data[c].insert(data[c].end(), cb, cb + 4);
+            } else {
+                const std::size_t w = byte_width(types[c]);
+                const std::byte* src = col.data + static_cast<std::size_t>(p) * w;
+                data[c].insert(data[c].end(), src, src + w);
+            }
             valid[c].push_back(v ? 1u : 0u);
         }
         return static_cast<std::uint32_t>(nrows++);
     }
 
     const std::byte* col_data(std::size_t c) const { return data[c].data(); }
+    const std::shared_ptr<StringDict>& col_dict(std::size_t c) const {
+        return col_dicts[c];
+    }
 };
 
 // Gather the DATA words of one column by index `idx[0..m)` into `out` (length m),
@@ -74,7 +100,8 @@ inline void gather_data(OwnedColumn& out, Type t, const std::byte* src,
                         const std::uint32_t* idx, std::size_t m, GatherPath gp) {
     std::byte* dst = out.mutable_data();
     switch (t) {
-        case Type::I32: {
+        case Type::I32:
+        case Type::STR: {  // WP-7b: STR = int32 dict code; gather the 4-byte codes
             auto* d = reinterpret_cast<std::uint32_t*>(dst);
             const auto* s = reinterpret_cast<const std::uint32_t*>(src);
             if (gp == GatherPath::kVector)
@@ -110,6 +137,9 @@ inline void emit_probe_column(OwnedColumn& out, const Column& src,
                               const std::uint32_t* phys_idx, std::size_t m,
                               GatherPath gp) {
     gather_data(out, src.type, src.data, phys_idx, m, gp);
+    // WP-7b: gathered STR codes stay valid in the source's dict, which belongs to
+    // the LIVE probe batch (held across this next() call) — reference it.
+    if (src.type == Type::STR) out.set_dict_ref(src.dict);
     if (!src.all_valid) {
         for (std::size_t r = 0; r < m; ++r)
             if (!validity::get_bit(src.validity, phys_idx[r])) out.set_null(r);
@@ -124,6 +154,10 @@ inline void emit_build_column(OwnedColumn& out, const BuildStore& store,
                               std::size_t c, const std::uint32_t* build_idx,
                               std::size_t m, GatherPath gp,
                               std::vector<std::uint32_t>& scratch_idx) {
+    // WP-7b: STR build output indexes the store's OWNED dict (built during append),
+    // which outlives emit. Attach it unconditionally (even the all-NULL paths) so
+    // the STR output column is well-formed.
+    if (store.types[c] == Type::STR) out.set_dict(store.col_dict(c));
     if (store.nrows == 0) {
         // No build rows at all (LEFT join, every probe row unmatched): the entire
         // column is NULL. Skip the gather (gathering from an empty source would be

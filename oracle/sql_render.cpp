@@ -17,6 +17,7 @@ std::string sql_type(Type t) {
         case Type::F64: return "DOUBLE";
         case Type::BOOL: return "BOOLEAN";
         case Type::TS: return "BIGINT";
+        case Type::STR: return "VARCHAR";  // WP-7b: dictionary-encoded text
     }
     return "BIGINT";  // unreachable
 }
@@ -69,6 +70,10 @@ std::string scalar_sql(const Scalar& s) {
             os.precision(17);
             os << s.f;
             break;
+        case Type::STR:
+            // WP-7b: the frozen Scalar carries no string payload, so STR literals
+            // are never built (STR comparisons are column-vs-column). Unreachable.
+            throw std::logic_error("scalar_sql: STR literals are unsupported");
     }
     return os.str();
 }

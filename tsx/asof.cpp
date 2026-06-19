@@ -74,6 +74,7 @@ TimeVal read_time(const Column& c, std::uint32_t phys) {
             return {true, reinterpret_cast<const std::int64_t*>(c.data)[phys]};
         case Type::F64:
         case Type::BOOL:
+        case Type::STR:  // WP-7b: STR is out of the as-of grammar (no STR timestamps)
             assert(false && "asof timestamp column must be I32/I64/TS");
             return {false, 0};
     }

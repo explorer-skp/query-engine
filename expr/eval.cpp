@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #include "core/types.h"
@@ -123,6 +124,14 @@ OwnedColumn materialize_literal(const Scalar& s, std::size_t n) {
                 p[i] = static_cast<std::uint8_t>(s.i ? 1 : 0);
             break;
         }
+        case Type::STR:
+            // WP-7b: the frozen Scalar (expr/expr.h) carries no string payload, so
+            // a STR literal cannot be represented and the builders never make one.
+            // STR comparisons in this engine are column-vs-column (see the WP
+            // report). Reject loudly rather than fabricate a value.
+            throw std::invalid_argument(
+                "STR literals are unsupported (Scalar has no string payload); "
+                "compare STR columns to STR columns");
     }
     if (s.is_null && n > 0) {
         out.ensure_validity();
@@ -163,6 +172,37 @@ OwnedColumn from_tristate(const std::vector<std::uint8_t>& ts, std::size_t n) {
     return out;
 }
 
+// ---- STR comparison (by VALUE via the dicts) -------------------------------
+//
+// WP-7b: STR operands are dictionary CODES; equality/order is by the resolved
+// string BYTES, never the raw code (two columns may carry different dicts, and
+// equal strings can get different codes). This is inherently SCALAR control flow
+// (variable-length byte compare), so there is no Highway twin — the Vector and
+// Scalar backends drive this same routine (documented in the WP report; the
+// scalar==vector gate over STR is therefore trivially satisfied because the STR
+// path is identical on both backends, exactly the WP-5/WP-6/WP-12 precedent for
+// inherently-sequential steps). `a`/`b` are dense (selection already applied);
+// codes index directly. DuckDB VARCHAR ordering is bytewise on ASCII text, which
+// is std::string_view::compare.
+void cmp_str(CmpOp op, const Column& a, const Column& b, std::uint8_t* out,
+             std::size_t n) {
+    const auto* ca = reinterpret_cast<const std::int32_t*>(a.data);
+    const auto* cb = reinterpret_cast<const std::int32_t*>(b.data);
+    for (std::size_t i = 0; i < n; ++i) {
+        const int c = a.dict->at(ca[i]).compare(b.dict->at(cb[i]));
+        bool r = false;
+        switch (op) {
+            case CmpOp::Lt: r = c < 0; break;
+            case CmpOp::Le: r = c <= 0; break;
+            case CmpOp::Gt: r = c > 0; break;
+            case CmpOp::Ge: r = c >= 0; break;
+            case CmpOp::Eq: r = c == 0; break;
+            case CmpOp::Ne: r = c != 0; break;
+        }
+        out[i] = r ? 1 : 0;
+    }
+}
+
 // ---- node evaluation -------------------------------------------------------
 
 OwnedColumn eval_binary_arith(const Node& node, const Batch& batch, Backend be,
@@ -189,7 +229,9 @@ OwnedColumn eval_cmp(const Node& node, const Batch& batch, Backend be,
     const Type opnd = node.children[0].type();  // both children share this type
     OwnedColumn out = OwnedColumn::make(Type::BOOL, n);
     auto* o = reinterpret_cast<std::uint8_t*>(out.mutable_data());
-    if (be == Backend::Vector)
+    if (opnd == Type::STR)
+        cmp_str(node.cmp_op, a.view(), b.view(), o, n);  // by value (both backends)
+    else if (be == Backend::Vector)
         cmp_vec(node.cmp_op, opnd, a.data(), b.data(), o, n);
     else
         cmp_scalar(node.cmp_op, opnd, a.data(), b.data(), o, n);

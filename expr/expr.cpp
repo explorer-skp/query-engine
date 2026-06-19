@@ -57,6 +57,8 @@ const char* type_name(Type t) {
             return "BOOL";
         case Type::TS:
             return "TS";
+        case Type::STR:
+            return "STR";
     }
     return "?";
 }
@@ -88,7 +90,18 @@ Expr lit(Scalar s) {
 Expr cast(Expr e, Type to) {
     // Identity cast collapses to the child (no node needed).
     if (e.type() == to) return e;
-    // Every cross-type pair among the five Types is meaningful in this engine
+    // WP-7b: STR is dictionary-encoded text — there is no meaningful numeric
+    // conversion to or from it (DuckDB's VARCHAR<->numeric casts parse/format text,
+    // which this execution-technique engine deliberately does not implement). Any
+    // cross-type cast involving STR is a build-time type error (reject loudly here
+    // so it can never reach the kernels as a silent wrong result).
+    if (to == Type::STR || e.type() == Type::STR) {
+        throw std::invalid_argument(
+            std::string("cast: STR cannot be cast to/from ") +
+            type_name(to == Type::STR ? e.type() : to) +
+            " (STR is dictionary-encoded text, not a numeric type)");
+    }
+    // Every cross-type pair among the remaining Types is meaningful in this engine
     // (numeric<->numeric, ->/<-BOOL via !=0/{0,1}, TS<->I64 reinterpret, etc.).
     auto n = make_node(NodeKind::Cast, to);
     n->cast_to = to;

@@ -196,11 +196,24 @@ void put_key(OwnedColumn& c, Type t, std::size_t i, std::int64_t v) {
             reinterpret_cast<std::uint8_t*>(d)[i] =
                 static_cast<std::uint8_t>(v & 1);
             break;
+        case Type::STR:
+            break;  // WP-7b: STR keys are not generated (rand_key_type excludes it)
     }
+}
+
+// WP-7b: a small fixed vocabulary of short ASCII strings (no embedded NULs), the
+// divergence-safe alphabet for generated VARCHAR data (generators.h philosophy).
+const std::vector<std::string>& default_str_alphabet() {
+    static const std::vector<std::string> a = {
+        "a",    "bb",   "cat",  "dog",   "echo", "fox",
+        "gamma", "hi",  "ix",   "joy",   "kilo", "lima"};
+    return a;
 }
 
 OwnedColumn gen_column(std::mt19937_64& rng, Type t, std::size_t n,
                        int null_pct) {
+    if (t == Type::STR)
+        return gen_string_column(rng, default_str_alphabet(), n, null_pct);
     OwnedColumn c = OwnedColumn::make(t, n);
     void* d = c.mutable_data();
     for (std::size_t i = 0; i < n; ++i) {
@@ -222,6 +235,8 @@ OwnedColumn gen_column(std::mt19937_64& rng, Type t, std::size_t n,
             case Type::BOOL:
                 static_cast<std::uint8_t*>(d)[i] = (rng() & 1u) ? 1 : 0;
                 break;
+            case Type::STR:
+                break;  // handled above (early return)
         }
         if (null_pct > 0 && static_cast<int>(rng() % 100) < null_pct)
             c.set_null(i);
@@ -230,6 +245,25 @@ OwnedColumn gen_column(std::mt19937_64& rng, Type t, std::size_t n,
 }
 
 }  // namespace
+
+OwnedColumn gen_string_column(std::mt19937_64& rng,
+                              const std::vector<std::string>& alphabet,
+                              std::size_t n, int null_pct) {
+    // A FRESH per-column dict: two columns built from the same alphabet get the
+    // same string VALUES but generally DIFFERENT codes (codes are assigned in
+    // first-use order, which varies with the random pick order) — exactly the
+    // cross-dictionary case STR equality/join must handle by VALUE, not by code.
+    auto dict = std::make_shared<StringDict>();
+    OwnedColumn c = OwnedColumn::make_str(n, dict);
+    auto* codes = reinterpret_cast<std::int32_t*>(c.mutable_data());
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::string& v = alphabet[rng() % alphabet.size()];
+        codes[i] = dict->intern(v);
+        if (null_pct > 0 && static_cast<int>(rng() % 100) < null_pct)
+            c.set_null(i);
+    }
+    return c;
+}
 
 Schema gen_schema(std::mt19937_64& rng, const GenConfig& cfg) {
     const int ncols =
@@ -448,6 +482,7 @@ void put_time(OwnedColumn& c, Type t, std::size_t i, std::int64_t v) {
             break;
         case Type::F64:
         case Type::BOOL:
+        case Type::STR:
             break;  // not a timestamp type (unreachable for asof)
     }
 }
@@ -751,7 +786,8 @@ PlanCase gen_plan_case(std::mt19937_64& rng) {
             case Type::I64: rhs = lit(Scalar::i64(50)); break;
             case Type::F64: rhs = lit(Scalar::f64(50.0)); break;
             case Type::TS:  rhs = lit(Scalar::ts(50)); break;
-            case Type::BOOL: rhs = lit(Scalar::i32(50)); break;  // unreachable
+            case Type::BOOL:
+            case Type::STR:  rhs = lit(Scalar::i32(50)); break;  // unreachable
         }
         b = b.filter(cmp(CmpOp::Lt, col(kt, 0), std::move(rhs)));
     }

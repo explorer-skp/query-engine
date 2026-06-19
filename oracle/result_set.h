@@ -27,11 +27,15 @@
 
 namespace qe::oracle {
 
-// One output value. For I32/I64/BOOL/TS the payload is `i`; for F64 it is `f`.
+// One output value. For I32/I64/BOOL/TS the payload is `i`; for F64 it is `f`;
+// for STR (WP-7b) it is the decoded string VALUE `s` (every side — engine,
+// reference, DuckDB — stores the actual text, so STR compares by value, never by
+// dictionary code; strings are exact, no float tolerance).
 struct Cell {
     bool is_null = false;
     std::int64_t i = 0;
     double f = 0.0;
+    std::string s;
 };
 
 // A materialized result: column types + rows of cells (row-major).

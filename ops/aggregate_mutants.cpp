@@ -193,6 +193,10 @@ void write_agg_cell_mut(OwnedColumn& out, std::size_t r, AggFunc func,
             case Type::F64:
                 reinterpret_cast<double*>(d)[r] = c.d;
                 break;
+            case Type::STR:  // WP-7b: MIN/MAX(str) code (mutant path, unused by STR)
+                reinterpret_cast<std::int32_t*>(d)[r] =
+                    static_cast<std::int32_t>(c.i);
+                break;
         }
         return;
     }

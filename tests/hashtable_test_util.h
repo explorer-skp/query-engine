@@ -24,7 +24,9 @@ inline OwnedColumn make_col(Type t, const std::vector<std::int64_t>& bits,
     std::byte* d = c.mutable_data();
     for (std::size_t i = 0; i < n; ++i) {
         switch (t) {
-            case Type::I32: {
+            case Type::I32:
+            case Type::STR: {  // WP-7b: STR stores an int32 dict code (numeric tests
+                               // never request STR; a dict is attached separately)
                 auto v = static_cast<std::int32_t>(bits[i]);
                 std::memcpy(d + i * 4, &v, 4);
                 break;

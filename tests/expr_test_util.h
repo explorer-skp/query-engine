@@ -59,6 +59,11 @@ inline bool col_equal(const OwnedColumn& x, const OwnedColumn& y) {
                     reinterpret_cast<const std::uint8_t*>(cy.data)[i])
                     return false;
                 break;
+            case Type::STR:  // WP-7b: compare by VALUE via each column's dict
+                if (cx.dict->at(reinterpret_cast<const std::int32_t*>(cx.data)[i]) !=
+                    cy.dict->at(reinterpret_cast<const std::int32_t*>(cy.data)[i]))
+                    return false;
+                break;
         }
     }
     return true;
@@ -99,6 +104,10 @@ inline OwnedColumn random_column(std::mt19937_64& rng, Type type, std::size_t n,
             }
             case Type::BOOL:
                 static_cast<std::uint8_t*>(d)[i] = (rng() & 1u) ? 1 : 0;
+                break;
+            case Type::STR:
+                // WP-7b: STR needs an out-of-band dict; the numeric expr tests never
+                // request it (use the dedicated WP-7b string builders instead).
                 break;
         }
         if (null_pct > 0 && static_cast<int>(rng() % 100) < null_pct)

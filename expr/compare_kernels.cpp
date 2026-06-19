@@ -83,6 +83,10 @@ void CmpImpl(CmpOp op, Type t, const void* a, const void* b, std::uint8_t* out,
             CmpT<std::uint8_t>(op, static_cast<const std::uint8_t*>(a),
                                static_cast<const std::uint8_t*>(b), out, n);
             break;
+        case Type::STR:
+            // WP-7b: STR compares by VALUE via the dicts in eval.cpp::cmp_str
+            // (inherently scalar); never dispatched to the numeric vector path.
+            break;
     }
 }
 

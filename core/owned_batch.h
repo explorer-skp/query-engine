@@ -11,11 +11,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
 #include "core/buffer.h"
 #include "core/column.h"
+#include "core/string_dict.h"
 #include "core/types.h"
 
 namespace qe {
@@ -31,6 +33,12 @@ class OwnedColumn {
     // all_valid == true. Marking a null later (set_null) lazily allocates the
     // bitmap.
     static OwnedColumn make(Type type, std::size_t len);
+
+    // WP-7b: a Type::STR column of `len` int32 codes, all-valid, carrying `dict`
+    // (the code->bytes table). Fill the codes via mutable_data() (as int32) and
+    // intern through the dict; the codes must be valid indices into `dict`.
+    static OwnedColumn make_str(std::size_t len,
+                                std::shared_ptr<const StringDict> dict);
 
     Type type() const noexcept { return type_; }
     std::size_t len() const noexcept { return len_; }
@@ -63,6 +71,22 @@ class OwnedColumn {
     // bulk-editing the validity words directly.
     void refresh_all_valid();
 
+    // WP-7b STR dictionary. A STR OwnedColumn MUST carry a dict before view() is
+    // called (view() publishes it as Column::dict). Two ways to attach one:
+    //   * set_dict(shared)     — this column shares OWNERSHIP of the dict (source
+    //     columns and operator-derived dicts, e.g. aggregate group keys).
+    //   * set_dict_ref(raw)    — this column merely REFERENCES a dict owned and
+    //     kept alive elsewhere (gathered/compacted subsets reuse their source's
+    //     dict; the codes are unchanged so they stay valid in that same dict).
+    // dict() exposes the raw pointer view() will publish (nullptr if unset).
+    void set_dict(std::shared_ptr<const StringDict> d) { dict_ = std::move(d); }
+    void set_dict_ref(const StringDict* d) {
+        // Aliasing shared_ptr: shares the pointer, owns nothing (caller guarantees
+        // lifetime, exactly as for data()/validity() backing storage).
+        dict_ = std::shared_ptr<const StringDict>(std::shared_ptr<void>{}, d);
+    }
+    const StringDict* dict() const noexcept { return dict_.get(); }
+
     // Frozen view applying the precedence rule: validity is exposed only when
     // all_valid is false.
     Column view() const;
@@ -73,6 +97,8 @@ class OwnedColumn {
     Buffer data_;
     Buffer validity_;  // empty() => no bitmap allocated
     bool all_valid_ = true;
+    // WP-7b: non-null only for Type::STR (owning or aliasing per set_dict*).
+    std::shared_ptr<const StringDict> dict_;
 };
 
 // One owned batch: a set of OwnedColumns plus optional owned selection-vector

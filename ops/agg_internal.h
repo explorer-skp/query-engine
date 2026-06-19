@@ -88,6 +88,12 @@ inline ColVal read_col(const Column& c, const SelectionVector* sel,
         case Type::F64:
             r.d = reinterpret_cast<const double*>(c.data)[p];
             break;
+        case Type::STR:
+            // WP-7b: the int32 dictionary code lands in `i`. COUNT(str) only needs
+            // `valid`; MIN/MAX(str) compare by VALUE and are handled specially in
+            // aggregate.cpp (this code alone is not order-meaningful — see report).
+            r.i = reinterpret_cast<const std::int32_t*>(c.data)[p];
+            break;
     }
     return r;
 }
@@ -124,6 +130,13 @@ inline void write_key_cell(OwnedColumn& out, std::size_t r, Type t, bool is_null
         case Type::BOOL:
             reinterpret_cast<std::uint8_t*>(d)[r] =
                 static_cast<std::uint8_t>(word & 1ull);
+            break;
+        case Type::STR:
+            // WP-7b: the group-key word is a dictionary code (canonicalized into the
+            // aggregate's owned dict); write it as the int32 code. The caller
+            // attaches that owned dict to the output column.
+            reinterpret_cast<std::int32_t*>(d)[r] =
+                static_cast<std::int32_t>(word);
             break;
     }
 }
@@ -174,6 +187,13 @@ inline void write_agg_cell(OwnedColumn& out, std::size_t r, AggFunc func,
                     break;
                 case Type::F64:
                     reinterpret_cast<double*>(d)[r] = c.d;
+                    break;
+                case Type::STR:
+                    // WP-7b: MIN/MAX(str) result is a dictionary code (the canonical
+                    // min/max string's code in the aggregate's owned dict, chosen by
+                    // VALUE in aggregate.cpp); write it as int32.
+                    reinterpret_cast<std::int32_t*>(d)[r] =
+                        static_cast<std::int32_t>(c.i);
                     break;
             }
             return;
