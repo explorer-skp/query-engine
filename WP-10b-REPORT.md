@@ -3,7 +3,9 @@
 **Scope:** an *optional, additive* parallel-execution layer (decision D15) that runs a
 built `plan::Plan` across worker threads and returns the **same logical result** as the
 single-thread plan path, proven by the oracle. **No frozen-interface change.** New gate:
-**TSan green.**
+**TSan green.** (Result of record, 2026-07-05 audit rerun: full 51-test suite
+green under `ctest --preset tsan` including the WP-7b string tests — which the
+original TSan run predated — via `./scripts/ci.sh`.)
 
 ## What landed
 
@@ -36,8 +38,11 @@ frozen operators — nothing in `core/ ops/ expr/ plan/ tsx/ simd/` changed:
     partial result; the exchange **concatenates** (order-free; the diff canonicalizes,
     D12).
   - **Join:** the **probe** side is morsel-partitioned; each worker builds its **own**
-    build-side hash table (single-thread build *per worker*) and probes its probe-morsels;
-    outputs concatenate. (The brief permits per-worker build; the shared-build-once
+    build-side hash table and probes its probe-morsels; outputs concatenate.
+    CORRECTION (audit): the private build is rebuilt per *morsel*, not per worker —
+    `lower_morsel` full-lowers the build child for every morsel it wins, so a
+    100k-row probe at 1024-row morsels rebuilds the build side ~98 times. Correct
+    but redundant. (The brief permits per-worker build; the shared-build-once
     optimization is future work — see *Assumptions*.)
   - **Aggregate (group-by):** each **worker** accumulates a **private** partial hash
     aggregate over all its morsels (running a frozen `Aggregate` per morsel, then folding
