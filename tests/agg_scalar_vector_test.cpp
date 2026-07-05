@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <algorithm>
+#include <limits>
 #include <vector>
 
 #include "doctest/doctest.h"
@@ -82,6 +84,46 @@ TEST_CASE("scalar==vector: agg_min/max i64 + f64 (exact), n>=1") {
         CHECK(agg_max_i64_vec(vi.data(), n) == agg_max_i64_scalar(vi.data(), n));
         CHECK(agg_min_f64_vec(vf.data(), n) == agg_min_f64_scalar(vf.data(), n));
         CHECK(agg_max_f64_vec(vf.data(), n) == agg_max_f64_scalar(vf.data(), n));
+    }
+}
+
+// Audit C2: NaN inputs. The F64 MIN/MAX contract is the NaN-greatest TOTAL order
+// (MIN == NaN iff ALL elements are NaN; MAX == NaN iff ANY element is). Raw
+// hn::Min/Max NaN behavior is ISA-dependent (NEON returns NaN, x86 the second
+// operand), so this case is exactly where scalar==vector proves the kernels are
+// deterministic across targets. NaN==NaN compared via bit-class, not ==.
+TEST_CASE("scalar==vector: agg_min/max f64 with NaN lanes (total order)") {
+    std::mt19937_64 rng(qe::test::seed() ^ 0x4A4Eu);
+    std::uniform_real_distribution<double> df(-1e6, 1e6);
+    const double qnan = std::numeric_limits<double>::quiet_NaN();
+    auto same = [](double a, double b) {
+        return (std::isnan(a) && std::isnan(b)) || a == b;
+    };
+    for (std::size_t n : kLens) {
+        if (n == 0) continue;
+        for (int density = 0; density < 3; ++density) {  // some / most / all NaN
+            std::vector<double> vf(n);
+            for (std::size_t k = 0; k < n; ++k) {
+                const bool nan_here = density == 2 || (rng() % 4) < (density ? 3u : 1u);
+                vf[k] = nan_here ? qnan : df(rng);
+            }
+            const double mnv = agg_min_f64_vec(vf.data(), n);
+            const double mns = agg_min_f64_scalar(vf.data(), n);
+            const double mxv = agg_max_f64_vec(vf.data(), n);
+            const double mxs = agg_max_f64_scalar(vf.data(), n);
+            CHECK_MESSAGE(same(mnv, mns), "min vec=" << mnv << " scalar=" << mns
+                                                     << " n=" << n);
+            CHECK_MESSAGE(same(mxv, mxs), "max vec=" << mxv << " scalar=" << mxs
+                                                     << " n=" << n);
+            // MAX must be NaN iff any lane was NaN (both paths).
+            const bool any_nan = std::any_of(vf.begin(), vf.end(),
+                                             [](double x) { return std::isnan(x); });
+            CHECK(std::isnan(mxs) == any_nan);
+            // MIN must be NaN iff every lane was NaN.
+            const bool all_nan = std::all_of(vf.begin(), vf.end(),
+                                             [](double x) { return std::isnan(x); });
+            CHECK(std::isnan(mns) == all_nan);
+        }
     }
 }
 
