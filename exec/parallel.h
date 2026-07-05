@@ -21,7 +21,9 @@
 //       - Scan/Filter/Project/Join (streaming): each morsel emits partial output;
 //         the exchange CONCATENATES them (order-free; the diff canonicalizes, D12).
 //         A Join parallelizes the PROBE morsels against a build-side hash table that
-//         each worker builds privately (single-thread build per worker — acceptable
+//         each MORSEL's private tree rebuilds it (a full build per morsel, not
+//         merely per worker — more redundant than the brief's concession but
+//         correct; the shared-build-once seam remains future work — acceptable
 //         per the WP brief; the shared-build optimization is future work).
 //       - Aggregate (group-by): each WORKER accumulates a PRIVATE partial hash
 //         aggregate over all its morsels (AVG decomposed to SUM+COUNT so partials

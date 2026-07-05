@@ -15,6 +15,7 @@
 #include "core/owned_batch.h"
 #include "core/types.h"
 #include "exec/morsel_scan.h"
+#include "ops/agg_internal.h"
 #include "ops/aggregate.h"
 #include "ops/filter.h"
 #include "ops/join.h"
@@ -100,7 +101,7 @@ std::unique_ptr<Operator> lower_morsel(const Plan& p, const Morsel& m) {
         case PlanKind::Join:
             return std::make_unique<HashJoin>(
                 lower_morsel(n.children[0], m),    // probe: morsel-ized
-                n.children[1].lower(kScanBatch),   // build: full, private per worker
+                n.children[1].lower(kScanBatch),   // build: full, private PER MORSEL
                 n.left_keys, n.right_keys, n.join_type);
         default:
             throw std::logic_error(
@@ -295,13 +296,22 @@ void fold_plain(Acc& a, const Cell& c, PK k) {
             if (!c.is_null) { a.i = a.seen ? std::min(a.i, c.i) : c.i; a.seen = true; }
             break;
         case PK::MinF:
-            if (!c.is_null) { a.f = a.seen ? std::min(a.f, c.f) : c.f; a.seen = true; }
+            // NaN-greatest total order (ops/agg_internal.h, audit C2): the
+            // frozen Aggregate's partials obey it, so the cross-worker merge
+            // must too or parallel != single-thread on NaN inputs.
+            if (!c.is_null) {
+                a.f = a.seen ? qe::ops::detail::f64_min_total(a.f, c.f) : c.f;
+                a.seen = true;
+            }
             break;
         case PK::MaxI:
             if (!c.is_null) { a.i = a.seen ? std::max(a.i, c.i) : c.i; a.seen = true; }
             break;
         case PK::MaxF:
-            if (!c.is_null) { a.f = a.seen ? std::max(a.f, c.f) : c.f; a.seen = true; }
+            if (!c.is_null) {
+                a.f = a.seen ? qe::ops::detail::f64_max_total(a.f, c.f) : c.f;
+                a.seen = true;
+            }
             break;
     }
 }
@@ -323,12 +333,34 @@ ParallelEngine::ParallelEngine(ParallelConfig cfg) {
     morsel_rows_ = m;
 }
 
+namespace {
+
+// WP-7b × WP-10b (audit C1b/C1c): the partial-aggregate exchange encodes group
+// keys and MIN/MAX partials from Cell.i, which carries no string value — STR
+// group keys would silently collapse into one group and MIN/MAX(STR) would emit
+// empty strings. Until the merge path speaks STR, such plans take the correct
+// single-thread fallback. (Streaming/Join/Sort STR plans are fine: each morsel
+// runs the frozen operators, and the exchange concatenates value-level cells.)
+bool aggregate_exchange_speaks(const PlanNode& n) {
+    const Schema child = n.children[0].output_schema();
+    for (std::uint32_t kc : n.group_keys)
+        if (child.fields[kc].second == Type::STR) return false;
+    for (const AggSpec& a : n.aggs)
+        if ((a.func == AggFunc::Min || a.func == AggFunc::Max) &&
+            child.fields[a.input_col].second == Type::STR)
+            return false;
+    return true;
+}
+
+}  // namespace
+
 bool ParallelEngine::supported(const Plan& p) {
     switch (p.kind()) {
         case PlanKind::Sort:
             return supported(p.node().children[0]);
         case PlanKind::Aggregate:
-            return streaming_morselizable(p.node().children[0]);
+            return aggregate_exchange_speaks(p.node()) &&
+                   streaming_morselizable(p.node().children[0]);
         case PlanKind::Scan:
         case PlanKind::Filter:
         case PlanKind::Project:
