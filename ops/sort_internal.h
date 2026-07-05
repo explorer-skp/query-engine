@@ -12,6 +12,8 @@
 //  §3/D17 — they are deliberately NOT shared here.
 #pragma once
 
+#include <cmath>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -31,7 +33,8 @@ namespace qe::sort_detail {
 // data buffer (n * byte_width(type)) plus one validity flag per row, per column.
 // Built by draining the child fully and honoring each batch's optional selection
 // vector and the validity precedence. It deliberately does NOT route through
-// core/owned_batch.h compact_column (whose n==0 path aborts — reviewer-owned),
+// core/owned_batch.h compact_column (a per-batch gather is the wrong shape for a
+// full-drain materialize; compact_column's old n==0 abort is long fixed),
 // so empty input is represented cleanly as num_rows()==0.
 struct MaterializedColumns {
     std::vector<Type> types;
@@ -87,5 +90,17 @@ bool radix_eligible(const std::vector<SortKey>& keys, const Schema& schema);
 // arise: source and destination are distinct buffers).
 OwnedBatch gather_rows(const MaterializedColumns& mat, const std::uint32_t* perm,
                        std::size_t start, std::size_t m, bool use_vector_gather);
+
+// Three-way F64 key compare under the NaN-greatest TOTAL order (audit C2; the
+// same policy as ops/agg_internal.h's f64_less_total, restated here so sort does
+// not depend on the aggregation headers). A raw <,> comparator returns "equal"
+// for NaN-vs-anything, which is not a strict weak ordering — std::stable_sort on
+// a NaN-bearing key column was UB — and diverges from DuckDB, which orders NaN
+// greater than every other value (all NaNs tie).
+inline int f64_cmp_total(double a, double b) {
+    const bool na = std::isnan(a), nb = std::isnan(b);
+    if (na || nb) return na == nb ? 0 : (na ? 1 : -1);  // NaN greatest; NaNs tie
+    return (a < b) ? -1 : (a > b) ? 1 : 0;
+}
 
 }  // namespace qe::sort_detail

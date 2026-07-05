@@ -76,9 +76,9 @@ bool less_row(const sd::MaterializedColumns& mat, const std::vector<SortKey>& ke
         }
         int cmp;
         if (mat.types[c] == Type::F64) {
-            const double fa = mat.f64_at(c, a);
-            const double fb = mat.f64_at(c, b);
-            cmp = (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
+            // NaN-greatest total order (sort_internal.h) -- raw <,> was UB
+            // under std::stable_sort for NaN keys and diverged from DuckDB.
+            cmp = sd::f64_cmp_total(mat.f64_at(c, a), mat.f64_at(c, b));
         } else if (mat.types[c] == Type::STR) {
             // WP-7b: order STR by VALUE (lexicographic bytes via the owned dict),
             // never by raw code. std::string_view ordering == DuckDB VARCHAR ASCII.

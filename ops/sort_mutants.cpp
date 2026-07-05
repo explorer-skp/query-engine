@@ -55,9 +55,8 @@ bool less_row_mut(const sd::MaterializedColumns& mat,
         }
         int cmp;
         if (mat.types[c] == Type::F64) {
-            const double fa = mat.f64_at(c, a);
-            const double fb = mat.f64_at(c, b);
-            cmp = (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
+            // Mirrors the real comparator's NaN-greatest total order (faithful copy).
+            cmp = sd::f64_cmp_total(mat.f64_at(c, a), mat.f64_at(c, b));
         } else {
             const std::int64_t ia = mat.int_at(c, a);
             const std::int64_t ib = mat.int_at(c, b);
