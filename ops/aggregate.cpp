@@ -136,7 +136,9 @@ inline void scatter_row(detail::AggCell& cell, AggFunc func, bool is_float,
         case AggFunc::Min:
             if (!v.valid) return;
             if (is_float)
-                cell.d = std::min(cell.d, v.d);
+                // NaN-greatest total order (agg_internal.h): NaN wins only when
+                // the whole group is NaN. Raw std::min silently dropped NaNs.
+                cell.d = detail::f64_min_total(cell.d, v.d);
             else
                 cell.i = std::min(cell.i, v.i);
             ++cell.cnt;
@@ -144,7 +146,7 @@ inline void scatter_row(detail::AggCell& cell, AggFunc func, bool is_float,
         case AggFunc::Max:
             if (!v.valid) return;
             if (is_float)
-                cell.d = std::max(cell.d, v.d);
+                cell.d = detail::f64_max_total(cell.d, v.d);
             else
                 cell.i = std::max(cell.i, v.i);
             ++cell.cnt;
@@ -159,12 +161,22 @@ inline void scatter_row(detail::AggCell& cell, AggFunc func, bool is_float,
 // the raw code via normalize_value) groups them together, and the group-key
 // read-back is a code valid in `dst` after the child closes. Grouping by raw,
 // un-canonicalized codes would be the "by code not by value" hazard.
-OwnedColumn canonicalize_str_key(const Column& src, StringDict& dst) {
+OwnedColumn canonicalize_str_key(const Column& src, const SelectionVector* sel,
+                                 StringDict& dst) {
     const std::size_t len = src.len;
     OwnedColumn out = OwnedColumn::make(Type::STR, len);
     auto* codes = reinterpret_cast<std::int32_t*>(out.mutable_data());
     const auto* src_codes = reinterpret_cast<const std::int32_t*>(src.data);
-    for (std::size_t p = 0; p < len; ++p) {
+    // Audit H3: touch ONLY the batch's live rows. Unselected physical slots are
+    // not required to hold meaningful codes (the Batch contract), so resolving
+    // them through the dict would be UB — and interning them pollutes the
+    // aggregate's owned dict with filtered-out values. The physical layout is
+    // preserved (sel keeps indexing the output); dead slots get code 0 and are
+    // never read by any sel-aware consumer.
+    std::memset(codes, 0, len * sizeof(std::int32_t));
+    const std::size_t n = sel ? sel->len : len;
+    for (std::size_t k = 0; k < n; ++k) {
+        const std::size_t p = sel_at(sel, k);
         const bool valid = src.all_valid || validity::get_bit(src.validity, p);
         if (valid)
             codes[p] = dst.intern(src.dict->at(src_codes[p]));
@@ -283,8 +295,12 @@ void Aggregate::drain_and_build() {
                 const AggFunc f = spec.func;
                 if (isf) {
                     st.scratch_d.resize(n);
+                    // MIN's identity is NaN under the NaN-greatest total order
+                    // (agg_internal.h): NULL slots folded as NaN are ignored by
+                    // the total-order reduction unless the batch has no real
+                    // value at all — which the nonnull count already handles.
                     const double id = (f == AggFunc::Min)
-                                          ? std::numeric_limits<double>::infinity()
+                                          ? std::numeric_limits<double>::quiet_NaN()
                                       : (f == AggFunc::Max)
                                           ? -std::numeric_limits<double>::infinity()
                                           : 0.0;
@@ -306,12 +322,14 @@ void Aggregate::drain_and_build() {
                         const double m = (kernel_path_ == AggKernelPath::kVector)
                                              ? ops::agg_min_f64_vec(p, n)
                                              : ops::agg_min_f64_scalar(p, n);
-                        cell.d = std::min(cell.d, m);
+                        // Cross-batch fold under the same NaN-greatest total
+                        // order as the kernels (raw std::min drops NaN).
+                        cell.d = detail::f64_min_total(cell.d, m);
                     } else {  // Max
                         const double m = (kernel_path_ == AggKernelPath::kVector)
                                              ? ops::agg_max_f64_vec(p, n)
                                              : ops::agg_max_f64_scalar(p, n);
-                        cell.d = std::max(cell.d, m);
+                        cell.d = detail::f64_max_total(cell.d, m);
                     }
                 } else {
                     st.scratch_i.resize(n);
@@ -365,7 +383,7 @@ void Aggregate::drain_and_build() {
         for (std::uint32_t col_idx : key_cols_) {
             const Column& kcol = b.cols[col_idx];
             if (kcol.type == Type::STR) {
-                canon_keys.push_back(canonicalize_str_key(kcol, *st.str_dict));
+                canon_keys.push_back(canonicalize_str_key(kcol, b.sel, *st.str_dict));
                 key_views.push_back(canon_keys.back().view());
             } else {
                 key_views.push_back(kcol);
