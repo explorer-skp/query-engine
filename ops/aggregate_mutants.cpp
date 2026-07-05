@@ -140,17 +140,26 @@ void Aggregate::drain_and_build() {
                     case AggFunc::Min:
                         if (!v.valid) break;
                         if (isf)
-                            cell.d = std::min(cell.d, v.d);
+                            cell.d = detail::f64_min_total(cell.d, v.d);
                         else
                             cell.i = std::min(cell.i, v.i);
                         ++cell.cnt;
                         break;
                     case AggFunc::Max:
                         if (!v.valid) break;
-                        if (isf)
-                            cell.d = std::max(cell.d, v.d);
-                        else
+                        if (isf) {
+                            if (mut_ == Mutation::kMaxDropsNan)
+                                // BUG: raw std::max drops NaN (comparisons with
+                                // NaN are false, so the accumulator survives) --
+                                // the exact pre-fix behavior of audit C2. Under
+                                // the NaN-greatest contract MAX must be NaN as
+                                // soon as any input is NaN.
+                                cell.d = std::max(cell.d, v.d);
+                            else
+                                cell.d = detail::f64_max_total(cell.d, v.d);
+                        } else {
                             cell.i = std::max(cell.i, v.i);
+                        }
                         ++cell.cnt;
                         break;
                     case AggFunc::CountStar:

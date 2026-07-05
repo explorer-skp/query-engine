@@ -34,7 +34,12 @@
 
 namespace qe::mutant {
 
-enum class Mutation { kFoldNullInSum, kEmptyGroupZero, kGroupTailOffByOne };
+enum class Mutation {
+    kFoldNullInSum,
+    kEmptyGroupZero,
+    kGroupTailOffByOne,
+    kMaxDropsNan  // F64 MAX via raw std::max: NaN inputs silently dropped (audit C2)
+};
 
 // Mirror of qe::Aggregate's GROUP BY surface, with a planted defect. Requires at
 // least one key column (the mutants live in the grouped path).
