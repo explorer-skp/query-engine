@@ -5,6 +5,7 @@
 
 #include "tests/catalog_checks.h"
 
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -49,6 +50,31 @@ Verdict agg_fold_null_in_sum() {
     auto mut = std::make_unique<mutant::Aggregate>(
         std::move(scan), q.group_by->keys, q.group_by->aggs,
         mutant::Mutation::kFoldNullInSum);
+    return single_table_verdict(t, q, std::move(mut), /*ordered=*/false);
+}
+
+Verdict agg_max_drops_nan() {
+    // Audit C2: F64 MAX under the NaN-greatest total order (DuckDB semantics)
+    // must return NaN as soon as any non-NULL input is NaN. The mutant's raw
+    // std::max drops NaN (every comparison with NaN is false, so the running
+    // accumulator survives) — group 1 {1.0, NaN} emits 1.0 instead of NaN.
+    // Group 2 is a NaN-free control so clean==mutant off the decisive cells.
+    const double qnan = std::numeric_limits<double>::quiet_NaN();
+    Schema s;
+    s.fields.emplace_back("c0", Type::I32);
+    s.fields.emplace_back("c1", Type::F64);
+    std::vector<OwnedColumn> cols;
+    cols.push_back(i32_col({1, 1, 2, 2}));
+    cols.push_back(f64_col({1.0, qnan, 2.0, 3.0}));
+    const Table t(s, std::move(cols));
+
+    LogicalQuery q;
+    q.group_by = GroupBy{{0}, {AggSpec::max(1, "mx"), AggSpec::min(1, "mn")}};
+
+    auto scan = std::make_unique<Scan>(t, 64);
+    auto mut = std::make_unique<mutant::Aggregate>(
+        std::move(scan), q.group_by->keys, q.group_by->aggs,
+        mutant::Mutation::kMaxDropsNan);
     return single_table_verdict(t, q, std::move(mut), /*ordered=*/false);
 }
 

@@ -27,6 +27,7 @@ Verdict sort_desc_as_asc();
 
 // aggregate + plan (tests/catalog_checks_agg_plan.cpp)
 Verdict agg_fold_null_in_sum();
+Verdict agg_max_drops_nan();
 Verdict plan_drop_sort();
 
 // as-of join (tests/catalog_checks_asof.cpp) — WP-12
