@@ -12,7 +12,7 @@
 //
 //  The fix is signature-preserving — only the body of compact_column changed; the
 //  declaration in core/owned_batch.h is byte-for-byte unchanged (the sole, narrow,
-//  reviewer-authorized exception to the frozen-core rule). The matching 0-row
+//  deliberate exception to the frozen-core rule). The matching 0-row
 //  PLAN cases (a filter that selects nothing; a global aggregate over empty input),
 //  diffed against DuckDB, live in tests/oracle_zero_row_test.cpp.
 //
