@@ -26,12 +26,22 @@ namespace detail = qe::ops::detail;
 namespace {
 // Canonicalize a STR key column to a dense-by-physical-layout I32 value-id column
 // (real path). Identical to ops/join.cpp's helper.
-OwnedColumn canonicalize_str_key_to_i32(const Column& src, StringDict& idmap) {
+OwnedColumn canonicalize_str_key_to_i32(const Column& src,
+                                        const SelectionVector* sel,
+                                        StringDict& idmap) {
     const std::size_t len = src.len;
     OwnedColumn out = OwnedColumn::make(Type::I32, len);
     auto* ids = reinterpret_cast<std::int32_t*>(out.mutable_data());
     const auto* codes = reinterpret_cast<const std::int32_t*>(src.data);
-    for (std::size_t p = 0; p < len; ++p) {
+    // Audit H3: touch ONLY the batch's live rows — unselected physical slots
+    // need not hold meaningful codes (Batch contract), so resolving them is UB
+    // and interning them pollutes the shared value-id dict. Physical layout is
+    // preserved (the batch's sel keeps indexing the output); dead slots get id
+    // 0 and are never read by any sel-aware consumer.
+    std::memset(ids, 0, len * sizeof(std::int32_t));
+    const std::size_t n = sel ? sel->len : len;
+    for (std::size_t k = 0; k < n; ++k) {
+        const std::size_t p = sel_at(sel, k);
         const bool valid = src.all_valid || validity::get_bit(src.validity, p);
         if (valid)
             ids[p] = idmap.intern(src.dict->at(codes[p]));
@@ -95,7 +105,7 @@ void StringKeyJoin::make_key_views(const std::vector<std::uint32_t>& keys,
         const bool is_str = col.type == Type::STR;
         if (is_str && mutation_ == StringKeyMutation::kNone) {
             st.canon_keys.push_back(
-                canonicalize_str_key_to_i32(col, *st.key_id_maps[i]));
+                canonicalize_str_key_to_i32(col, b.sel, *st.key_id_maps[i]));
             st.key_views.push_back(st.canon_keys.back().view());
         } else {
             // kHashRawCode (the bug): pass the raw STR column — the table hashes
