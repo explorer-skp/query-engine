@@ -56,14 +56,17 @@ inline OwnedColumn f64_col(const std::vector<double>& v) {
 // Diff `got` against the independent reference `ref`, escalating to the
 // authoritative DuckDB result (via `duckdb`, evaluated lazily) only when DuckDB is
 // staged and the reference already agreed — mirroring every per-WP differential.
+// A DuckDBError is deliberately NOT caught here: every catalog check's query is
+// grammar-safe by construction, so a raise is a renderer/oracle regression, and
+// swallowing it would decide the verdict against the (non-independent) reference
+// alone while MUTATION_CATALOG.md claims DuckDB decided (audit C3). The exception
+// propagates and fails the meta-test loudly.
 inline qe::oracle::DiffResult diff_with_duckdb(
     const qe::oracle::ResultSet& got, const qe::oracle::ResultSet& ref,
     const std::function<qe::oracle::ResultSet()>& duckdb, bool ordered) {
     qe::oracle::DiffResult d = qe::oracle::compare_result_sets(got, ref, ordered);
     if (d.equal && qe::oracle::duckdb_available() && duckdb) {
-        try {
-            d = qe::oracle::compare_result_sets(got, duckdb(), ordered);
-        } catch (const qe::oracle::DuckDBError&) { /* divergence backstop */ }
+        d = qe::oracle::compare_result_sets(got, duckdb(), ordered);
     }
     return d;
 }

@@ -80,7 +80,12 @@ DiffResult diff_single(const Table& t, const LogicalQuery& q, std::size_t bs) {
     if (d.equal && duckdb_available()) {
         try {
             d = compare_result_sets(eng, run_duckdb(t, q), ordered);
-        } catch (const DuckDBError&) { /* divergence backstop */ }
+        } catch (const DuckDBError& e) {
+            // Grammar-safe case: a raise is a renderer/oracle regression, not a
+            // divergence. Silently skipping would disable DuckDB coverage with
+            // CI green (audit C3) -- fail loudly instead.
+            FAIL("DuckDB raised on a grammar-safe case: " << std::string(e.what()));
+        }
     }
     return d;
 }
@@ -95,7 +100,12 @@ DiffResult diff_join(const Table& probe, const Table& build, const JoinQuery& jq
     if (d.equal && duckdb_available()) {
         try {
             d = compare_result_sets(eng, run_join_duckdb(probe, build, jq));
-        } catch (const DuckDBError&) { /* divergence backstop */ }
+        } catch (const DuckDBError& e) {
+            // Grammar-safe case: a raise is a renderer/oracle regression, not a
+            // divergence. Silently skipping would disable DuckDB coverage with
+            // CI green (audit C3) -- fail loudly instead.
+            FAIL("DuckDB raised on a grammar-safe case: " << std::string(e.what()));
+        }
     }
     return d;
 }

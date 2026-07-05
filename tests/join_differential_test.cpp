@@ -50,7 +50,7 @@ DiffResult join_diff_all(const Table& p, const Table& b, const JoinQuery& q,
             DiffResult d = run_join_differential(p, b, q, run_join_duckdb, bs);
             if (!d.equal) return d;
         } catch (const DuckDBError& e) {
-            MESSAGE("DuckDB raised (skipped, not a diff): " << e.what());
+            FAIL("DuckDB raised on a grammar-safe generated case -- renderer/oracle regression, not a divergence: " << std::string(e.what()));
         }
     }
     return ref;

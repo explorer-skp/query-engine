@@ -58,7 +58,7 @@ DiffResult plan_diff_all(const Plan& p, std::size_t bs) {
             DiffResult d = run_plan_differential(p, run_plan_duckdb, bs);
             if (!d.equal) return d;
         } catch (const DuckDBError& e) {
-            MESSAGE("DuckDB raised (skipped, not a diff): " << e.what());
+            FAIL("DuckDB raised on a grammar-safe generated case -- renderer/oracle regression, not a divergence: " << std::string(e.what()));
         }
     }
     return ref;

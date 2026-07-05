@@ -50,7 +50,8 @@ const std::size_t kBatchSizes[] = {64, 256, 2048};
 // Diff a Plan vs the reference (always) and, when staged, DuckDB — across batch
 // sizes (the Scan requires a positive multiple of 64). Ordered iff root is Sort.
 bool zero_row_diffs_green(const Plan& p) {
-    const bool ordered = p.kind() == PlanKind::Sort;
+    // (run_plan_vs_reference/run_plan_differential decide ordered-vs-canonical
+    // from the plan root themselves; a local `ordered` here was dead code.)
     for (std::size_t bs : kBatchSizes) {
         const DiffResult ref = run_plan_vs_reference(p, bs);
         if (!ref.equal) {
@@ -67,11 +68,10 @@ bool zero_row_diffs_green(const Plan& p) {
                     return false;
                 }
             } catch (const DuckDBError& e) {
-                MESSAGE("DuckDB raised (skipped, not a diff): " << e.what());
+                FAIL("DuckDB raised on a grammar-safe generated case -- renderer/oracle regression, not a divergence: " << std::string(e.what()));
             }
         }
     }
-    (void)ordered;
     return true;
 }
 

@@ -60,7 +60,12 @@ DiffResult diff_tree_vs_plan_oracles(Operator& tree, const Plan& p) {
     if (d.equal && duckdb_available()) {
         try {
             d = compare_result_sets(engine, run_plan_duckdb(p), ordered);
-        } catch (const DuckDBError&) { /* divergence backstop; ignore */ }
+        } catch (const DuckDBError& e) {
+            // Grammar-safe case: a raise is a renderer/oracle regression, not a
+            // divergence. Silently skipping would disable DuckDB coverage with
+            // CI green (audit C3) -- fail loudly instead.
+            FAIL("DuckDB raised on a grammar-safe case: " << std::string(e.what()));
+        }
     }
     return d;
 }
