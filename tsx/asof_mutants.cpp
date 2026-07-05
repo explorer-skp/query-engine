@@ -211,12 +211,18 @@ bool AsofJoin::build_pairs_for_probe() {
                 if (st.cursor < blist.size()) {
                     const std::uint32_t cand = blist[st.cursor];
                     if (!tolerance_ ||
-                        (st.build_ts[cand] - tv.t) <= *tolerance_)
+                        static_cast<std::uint64_t>(st.build_ts[cand]) -
+                                static_cast<std::uint64_t>(tv.t) <=
+                            static_cast<std::uint64_t>(*tolerance_))
                         matched = cand;
                 }
             } else if (st.cursor > 0) {
                 const std::uint32_t cand = blist[st.cursor - 1];
-                if (!tolerance_ || (tv.t - st.build_ts[cand]) <= *tolerance_)
+                // Mirrors the real operator's unsigned-span idiom (audit H4).
+                if (!tolerance_ ||
+                    static_cast<std::uint64_t>(tv.t) -
+                            static_cast<std::uint64_t>(st.build_ts[cand]) <=
+                        static_cast<std::uint64_t>(*tolerance_))
                     matched = cand;
             }
         }

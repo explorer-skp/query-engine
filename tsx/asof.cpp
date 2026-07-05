@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 #include <utility>
 
 #include "core/selection.h"
@@ -137,6 +138,18 @@ AsofJoin::AsofJoin(std::unique_ptr<Operator> probe,
     // and the key/time column indices are unchanged by the sort).
     probe_schema_ = probe->output_schema();
     build_schema_ = build->output_schema();
+    // Real checks in EVERY build (audit H5): the timestamp reader's non-integer
+    // arm is a debug assert — under NDEBUG an F64/BOOL/STR time column silently
+    // read as "NULL timestamp" and the whole join degraded to no-matches.
+    auto ts_ok = [](Type t) { return t == Type::I32 || t == Type::I64 || t == Type::TS; };
+    if (!ts_ok(probe_schema_.fields[probe_time_].second) ||
+        !ts_ok(build_schema_.fields[build_time_].second))
+        throw std::invalid_argument("AsofJoin: time columns must be I32/I64/TS");
+    for (std::size_t i = 0; i < probe_keys_.size(); ++i)
+        if (probe_schema_.fields[probe_keys_[i]].second !=
+            build_schema_.fields[build_keys_[i]].second)
+            throw std::invalid_argument(
+                "AsofJoin: key column types must match positionally");
 #ifndef NDEBUG
     for (std::size_t i = 0; i < probe_keys_.size(); ++i)
         assert(probe_schema_.fields[probe_keys_[i]].second ==
@@ -268,8 +281,15 @@ bool AsofJoin::build_pairs_for_probe() {
             if (st.cursor > 0) {
                 const std::uint32_t cand = blist[st.cursor - 1];
                 // Within-tolerance variant: keep the nearest preceding only if it
-                // is no further back than the tolerance window.
-                if (!tolerance_ || (tv.t - st.build_ts[cand]) <= *tolerance_)
+                // is no further back than the tolerance window. The span is
+                // computed in uint64: tv.t >= build_ts here, but the int64
+                // subtraction itself overflows for spans > INT64_MAX (e.g.
+                // probe INT64_MAX vs build -2) — UB flagged by audit H4; the
+                // WP-14 codecs use the same modular idiom.
+                if (!tolerance_ ||
+                    static_cast<std::uint64_t>(tv.t) -
+                            static_cast<std::uint64_t>(st.build_ts[cand]) <=
+                        static_cast<std::uint64_t>(*tolerance_))
                     matched = cand;
             }
         }

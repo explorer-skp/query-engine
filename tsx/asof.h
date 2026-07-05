@@ -16,10 +16,12 @@
 //   * NULL never matches: a probe/build row with a NULL in ANY key column, or a
 //     NULL timestamp, participates in no match (principled SQL semantics: `=`/`>=`
 //     on a NULL operand is NULL => non-match). An unmatched probe row follows the
-//     INNER / LEFT rule above. NULL KEYS agree with DuckDB. NULL TIMESTAMPS are a
-//     DOCUMENTED DIVERGENCE: DuckDB v1.1.3's ASOF instead matches a NULL probe
-//     timestamp to a NULL build timestamp within the same key partition; we take
-//     the principled never-match path and keep NULL timestamps out of the
+//     INNER / LEFT rule above. BOTH null classes are DOCUMENTED DIVERGENCES from
+//     DuckDB v1.1.3 and are excluded from the DuckDB-backed grammar (see
+//     WP-12-REPORT.md §3 and oracle/generators.cpp): DuckDB's ASOF matches a NULL
+//     probe timestamp to a NULL build timestamp within the same key partition, and
+//     its NULL-KEY matching is data-dependent (no well-defined semantics to
+//     mirror); we take the principled never-match path for both and keep NULL timestamps out of the
 //     differential grammar (the oracle generators do not emit them — see the WP
 //     report), validating the engine's NULL-timestamp behavior against the
 //     independent reference directly.
