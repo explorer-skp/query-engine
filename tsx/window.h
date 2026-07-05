@@ -9,7 +9,8 @@
 //
 //  * TUMBLING (time-bucketed aggregate). Partition by zero or more equality key
 //    columns PLUS a derived integer time bucket; aggregate per (keys…, bucket).
-//      - bucket_id   = t / W            (integer floor division; W > 0)
+//      - bucket_id   = t / W            (integer division TRUNCATING toward zero;
+//        floor only for t >= 0 — the grammar keeps ts >= 0; W > 0)
 //      - bucket_start = bucket_id * W   (the bucket's LOWER EDGE), emitted as the
 //        bucket column, typed as the timestamp column's type (TS / I64 / I32).
 //    Output schema: [partition keys…, bucket_start, aggregate columns…] — one row

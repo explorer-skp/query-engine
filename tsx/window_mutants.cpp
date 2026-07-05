@@ -82,13 +82,14 @@ void fold(detail::AggCell& cell, AggFunc func, bool is_float,
             return;
         case AggFunc::Min:
             if (!v.valid) return;
-            if (is_float) cell.d = std::min(cell.d, v.d);
+            // Mirrors the real fold's NaN-greatest total order (faithful copy).
+            if (is_float) cell.d = detail::f64_min_total(cell.d, v.d);
             else cell.i = std::min(cell.i, v.i);
             ++cell.cnt;
             return;
         case AggFunc::Max:
             if (!v.valid) return;
-            if (is_float) cell.d = std::max(cell.d, v.d);
+            if (is_float) cell.d = detail::f64_max_total(cell.d, v.d);
             else cell.i = std::max(cell.i, v.i);
             ++cell.cnt;
             return;
@@ -359,7 +360,9 @@ void Window::build_sliding() {
         const std::uint32_t col = aggs_[a].input_col;
         const detail::ColVal vx = store_val(st.store, col, x);
         const detail::ColVal vy = store_val(st.store, col, y);
-        return st.is_float[a] ? (vx.d < vy.d) : (vx.i < vy.i);
+        // Mirrors the real comparator's NaN-greatest total order (faithful copy).
+        return st.is_float[a] ? detail::f64_less_total(vx.d, vy.d)
+                              : (vx.i < vy.i);
     };
 
     std::size_t pstart = 0;

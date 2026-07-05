@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -132,13 +133,16 @@ void fold(detail::AggCell& cell, AggFunc func, bool is_float,
             return;
         case AggFunc::Min:
             if (!v.valid) return;
-            if (is_float) cell.d = std::min(cell.d, v.d);
+            // NaN-greatest total order (ops/agg_internal.h, audit C2): matches
+            // the Phase-1 Aggregate and DuckDB; raw std::min dropped NaNs and
+            // the tumbling/sliding modes disagreed with each other.
+            if (is_float) cell.d = detail::f64_min_total(cell.d, v.d);
             else cell.i = std::min(cell.i, v.i);
             ++cell.cnt;
             return;
         case AggFunc::Max:
             if (!v.valid) return;
-            if (is_float) cell.d = std::max(cell.d, v.d);
+            if (is_float) cell.d = detail::f64_max_total(cell.d, v.d);
             else cell.i = std::max(cell.i, v.i);
             ++cell.cnt;
             return;
@@ -215,6 +219,25 @@ Window::Window(std::unique_ptr<Operator> child, WindowMode mode,
       aggs_(std::move(aggs)) {
     assert(!aggs_.empty() && "Window needs >=1 aggregate");
     child_schema_ = child_->output_schema();
+    // Real checks in EVERY build (audit H5): the sliding path reads partition
+    // keys and aggregate inputs through store_val, whose STR arm is a debug
+    // assert — under NDEBUG a STR partition key read back 0 for every row, so
+    // ALL partitions silently merged. STR is out of the window grammar; reject
+    // it loudly at construction instead.
+    for (std::uint32_t kc : keys_)
+        if (child_schema_.fields[kc].second == Type::STR)
+            throw std::invalid_argument(
+                "Window: STR partition keys are not supported (out of grammar)");
+    for (const auto& a : aggs_)
+        if (a.func != AggFunc::CountStar &&
+            child_schema_.fields[a.input_col].second == Type::STR)
+            throw std::invalid_argument(
+                "Window: STR aggregate inputs are not supported (out of grammar)");
+    if (child_schema_.fields[time_].second == Type::F64 ||
+        child_schema_.fields[time_].second == Type::BOOL ||
+        child_schema_.fields[time_].second == Type::STR)
+        throw std::invalid_argument(
+            "Window: time column must be I32/I64/TS");
 #ifndef NDEBUG
     for (std::uint32_t kc : keys_)
         assert(kc < child_schema_.fields.size() && "window key col in range");
@@ -453,7 +476,12 @@ void Window::build_sliding() {
         const std::uint32_t col = aggs_[a].input_col;
         const detail::ColVal vx = store_val(st.store, col, x);
         const detail::ColVal vy = store_val(st.store, col, y);
-        return st.is_float[a] ? (vx.d < vy.d) : (vx.i < vy.i);
+        // F64 compares under the NaN-greatest TOTAL order (audit C2). A raw `<`
+        // made the monotonic deques order-dependent for NaN: frame {3.0, NaN}
+        // reported NaN for MIN while {NaN, 3.0} reported 3.0. Under the total
+        // order both report 3.0 (and MAX reports NaN), matching DuckDB.
+        return st.is_float[a] ? detail::f64_less_total(vx.d, vy.d)
+                              : (vx.i < vy.i);
     };
 
     std::size_t pstart = 0;
@@ -493,11 +521,11 @@ void Window::build_sliding() {
             ++acc[a].cnt;
             if (spec.func == AggFunc::Min) {
                 while (!acc[a].dq_min.empty() && !less_val(a, acc[a].dq_min.back(), i))
-                    acc[a].dq_min.pop_back();  // pop back values >= v (keep oldest min)
+                    acc[a].dq_min.pop_back();  // pop back values >= v (equal: keep NEWEST)
                 acc[a].dq_min.push_back(i);
             } else if (spec.func == AggFunc::Max) {
                 while (!acc[a].dq_max.empty() && !less_val(a, i, acc[a].dq_max.back()))
-                    acc[a].dq_max.pop_back();  // pop back values <= v (keep oldest max)
+                    acc[a].dq_max.pop_back();  // pop back values <= v (equal: keep NEWEST)
                 acc[a].dq_max.push_back(i);
             }
         }
