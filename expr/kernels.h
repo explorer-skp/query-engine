@@ -33,7 +33,7 @@ void arith_vec(ArithOp op, Type t, const void* a, const void* b, void* out,
 void arith_scalar(ArithOp op, Type t, const void* a, const void* b, void* out,
                   std::size_t n);
 
-// Comparison. a, b are n values of physical type `t` (any of the five Types);
+// Comparison. a, b are n values of physical type `t` (any Type except STR, which never reaches these kernels — see eval.cpp::cmp_str);
 // out is n bytes, each 0 or 1.
 void cmp_vec(CmpOp op, Type t, const void* a, const void* b, std::uint8_t* out,
              std::size_t n);

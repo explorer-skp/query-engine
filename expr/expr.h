@@ -26,8 +26,18 @@
 //   arithmetic (+ - * / %) and comparison (< <= > >= == !=):
 //       result is NULL iff ANY operand is NULL ("null-if-any").
 //   division / modulo by zero (integer AND float):
-//       result is NULL (matches DuckDB's default; also keeps integer division
-//       UB-free — see the overflow policy below).
+//       result is NULL. Integer /0 -> NULL matches DuckDB (which raises only
+//       outside SQL-NULL mode; the oracle renders `//`). Float /0 -> NULL is a
+//       DOCUMENTED DIVERGENCE from the pinned DuckDB v1.1.3 default
+//       (ieee_floating_point_ops=true -> ±inf/NaN); division is excluded from
+//       the oracle grammar (oracle/generators.h), so neither behavior is
+//       differentially checked. Also keeps integer division UB-free — see the
+//       overflow policy below.
+//   NaN in comparisons: IEEE semantics (every comparison with NaN is FALSE
+//       except !=). DuckDB instead defines NaN = NaN as TRUE and orders NaN
+//       greater than all values — a DOCUMENTED DIVERGENCE, masked by the
+//       finite-only generator domain (aggregation/sort NaN ordering, by
+//       contrast, IS aligned with DuckDB and differentially tested).
 //   logical AND / OR / NOT — SQL/Kleene THREE-VALUED logic:
 //       AND:  T∧T=T  T∧F=F  T∧N=N   F∧F=F  F∧N=F   N∧N=N
 //       OR:   T∨T=T  T∨F=T  T∨N=T   F∨F=F  F∨N=N   N∨N=N
@@ -158,7 +168,8 @@ Expr div(Expr a, Expr b);
 Expr mod(Expr a, Expr b);
 
 // Comparison (numeric operands are promoted to a common type; BOOL compares
-// BOOL, TS compares TS; result is BOOL).
+// BOOL, TS compares TS, and — WP-7b — STR compares STR by resolved string
+// VALUE (never by dictionary code); result is BOOL).
 Expr cmp(CmpOp op, Expr a, Expr b);
 Expr lt(Expr a, Expr b);
 Expr le(Expr a, Expr b);

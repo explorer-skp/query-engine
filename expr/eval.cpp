@@ -189,6 +189,15 @@ void cmp_str(CmpOp op, const Column& a, const Column& b, std::uint8_t* out,
     const auto* ca = reinterpret_cast<const std::int32_t*>(a.data);
     const auto* cb = reinterpret_cast<const std::int32_t*>(b.data);
     for (std::size_t i = 0; i < n; ++i) {
+        // NULL lanes carry NO defined code (builders only set_null them), so a
+        // dict lookup there is UB (unchecked offsets_ indexing — audit H3).
+        // propagate_nulls_and masks these lanes afterwards; emit a dummy byte.
+        const bool va = a.all_valid || validity::get_bit(a.validity, i);
+        const bool vb = b.all_valid || validity::get_bit(b.validity, i);
+        if (!va || !vb) {
+            out[i] = 0;  // masked by the null-propagation pass
+            continue;
+        }
         const int c = a.dict->at(ca[i]).compare(b.dict->at(cb[i]));
         bool r = false;
         switch (op) {
