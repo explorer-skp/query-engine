@@ -42,7 +42,7 @@ Then record the artifact's checksum here on staging (so the pin is verifiable):
 > comparator: the WP-3 generators are constrained so DuckDB never raises (no
 > div/mod, magnitude-bounded integer arithmetic, widening-only casts, finite
 > floats), so any 1.x release should diff identically. If you bump the version,
-> re-run `oracle_differential_test` and note it in the orchestrator change log.
+> re-run `oracle_differential_test` and note it in the project change log.
 
 ## After staging — reconfigure and run the DuckDB diff
 

@@ -4,7 +4,7 @@
 - **Pinned release:** `1.2.0` (tag `1.2.0`, `HWY_MAJOR.HWY_MINOR.HWY_PATCH == 1.2.0`,
   see `hwy/base.h`). Released 2024-05-31.
 - **License:** Apache-2.0 (`LICENSE`); a few files dual-licensed BSD-3 (`LICENSE-BSD3`).
-- **Why vendored, not FetchContent:** the project's self-contained rule (CLAUDE.md:
+- **Why vendored, not FetchContent:** the project's self-contained rule (RIGOR.md:
   "This repo is self-contained"). After this one-time vendor, no build step touches the
   network. `third_party/highway/CMakeLists.txt` is a *local minimal* build of the core
   library — we do **not** use upstream's 26 KB `CMakeLists.txt` (install/test/packaging
