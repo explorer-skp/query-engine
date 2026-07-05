@@ -24,7 +24,10 @@
 
 #include "doctest/doctest.h"
 
+#include "core/owned_batch.h"
+#include "core/string_dict.h"
 #include "exec/parallel.h"
+#include "expr/expr.h"
 #include "oracle/duckdb_oracle.h"
 #include "oracle/generators.h"
 #include "oracle/logical_query.h"
@@ -65,7 +68,12 @@ bool parallel_matches_all(const Plan& p, std::string& why) {
     bool have_duck = false;
     if (duckdb_available()) {
         try { duck = run_plan_duckdb(p); have_duck = true; }
-        catch (const DuckDBError&) { have_duck = false; }
+        catch (const DuckDBError& e) {
+            // Raise-free grammar: a raise is a renderer/oracle regression, and
+            // have_duck=false would silently drop DuckDB from the WHOLE run
+            // (audit C3) -- fail loudly instead.
+            FAIL("DuckDB raised on a grammar-safe case: " << std::string(e.what()));
+        }
     }
 
     for (unsigned t : kThreadCounts) {
@@ -200,4 +208,93 @@ TEST_CASE("WP-10b edge: global aggregate (zero keys) over empty input -> one row
                        .plan();
     std::string why;
     CHECK_MESSAGE(parallel_matches_all(p, why), why);
+}
+
+// ---- WP-7b x WP-10b: STR (dictionary VARCHAR) through the parallel layer -----
+// Audit C1: MorselScan must carry the STR dict into its batch views (C1a), the
+// streaming/join exchanges are value-level and therefore STR-correct, and the
+// partial-aggregate exchange does NOT yet speak STR — supported() must refuse
+// STR group keys / MIN-MAX(STR) so run() takes the correct single-thread
+// fallback (C1b/C1c). The random generators never emit STR, so these hand
+// tables are the only STR coverage on this path.
+
+namespace {
+
+Table str_payload_table(const std::vector<std::string>& strs,
+                        const std::vector<std::int64_t>& payload) {
+    REQUIRE(strs.size() == payload.size());
+    Schema s;
+    s.fields.emplace_back("c0", Type::STR);
+    s.fields.emplace_back("c1", Type::I64);
+    auto dict = std::make_shared<StringDict>();
+    OwnedColumn sc = OwnedColumn::make_str(strs.size(), dict);
+    auto* codes = reinterpret_cast<std::int32_t*>(sc.mutable_data());
+    for (std::size_t i = 0; i < strs.size(); ++i) codes[i] = dict->intern(strs[i]);
+    OwnedColumn pc = OwnedColumn::make(Type::I64, payload.size());
+    auto* pv = reinterpret_cast<std::int64_t*>(pc.mutable_data());
+    for (std::size_t i = 0; i < payload.size(); ++i) pv[i] = payload[i];
+    std::vector<OwnedColumn> cols;
+    cols.push_back(std::move(sc));
+    cols.push_back(std::move(pc));
+    return Table(s, std::move(cols));
+}
+
+// 200 rows over a 5-symbol alphabet so every {thread, morsel} split cuts
+// through repeated strings (a per-morsel dict-handling bug cannot hide).
+Table make_str_table(std::uint64_t salt) {
+    const char* syms[] = {"AAPL", "GOOG", "MSFT", "TSLA", "NVDA"};
+    std::vector<std::string> ss;
+    std::vector<std::int64_t> pp;
+    for (std::size_t i = 0; i < 200; ++i) {
+        ss.push_back(syms[(i * 7 + salt) % 5]);
+        pp.push_back(static_cast<std::int64_t>((i * 131 + salt * 17) % 1000) - 500);
+    }
+    return str_payload_table(ss, pp);
+}
+
+}  // namespace
+
+TEST_CASE("WP-10b STR: filter->project over a VARCHAR table (MorselScan dict)") {
+    using namespace qe::expr;
+    const Table t = make_str_table(1);
+    const Plan p = scan(t)
+                       .filter(gt(col(Type::I64, 1), lit(Scalar::i64(0))))
+                       .project({{"s", col(Type::STR, 0)}, {"v", col(Type::I64, 1)}})
+                       .plan();
+    REQUIRE(qe::exec::ParallelEngine::supported(p));  // streaming STR IS parallel
+    std::string why;
+    CHECK_MESSAGE(parallel_matches_all(p, why), why << "\n" << p.to_string());
+}
+
+TEST_CASE("WP-10b STR: join on VARCHAR keys, probe morselized") {
+    const Table probe = make_str_table(1);
+    const Table build = make_str_table(3);  // different intern order (by-value test)
+    for (auto jt : {JoinType::Inner, JoinType::Left}) {
+        const Plan p =
+            scan(probe).join(scan(build), {ColRef(0)}, {ColRef(0)}, jt).plan();
+        REQUIRE(qe::exec::ParallelEngine::supported(p));
+        std::string why;
+        CHECK_MESSAGE(parallel_matches_all(p, why), why << "\n" << p.to_string());
+    }
+}
+
+TEST_CASE("WP-10b STR: aggregate exchange refuses STR; fallback stays correct") {
+    const Table t = make_str_table(2);
+    // (a) STR group key: the partial-merge key encoding cannot represent it.
+    const Plan by_str = scan(t)
+                            .aggregate({ColRef(0)}, {AggSpec::count_star("n"),
+                                                     AggSpec::sum(1, "s")})
+                            .plan();
+    CHECK_FALSE(qe::exec::ParallelEngine::supported(by_str));
+    // (b) MIN/MAX over a STR input: the partial cells carry no string value.
+    const Plan minmax_str = scan(t)
+                                .aggregate({}, {AggSpec::min(0, "mn"),
+                                                AggSpec::max(0, "mx")})
+                                .plan();
+    CHECK_FALSE(qe::exec::ParallelEngine::supported(minmax_str));
+    // Both must still be CORRECT through run() (single-thread fallback).
+    for (const Plan* p : {&by_str, &minmax_str}) {
+        std::string why;
+        CHECK_MESSAGE(parallel_matches_all(*p, why), why << "\n" << p->to_string());
+    }
 }
