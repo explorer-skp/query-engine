@@ -47,9 +47,10 @@ DiffResult diff_all(const Table& t, const LogicalQuery& q, std::size_t bs) {
             DiffResult d = run_differential(t, q, run_duckdb, bs);
             if (!d.equal) return d;
         } catch (const DuckDBError& e) {
-            // Divergence backstop: generators should never produce a raising
-            // query, so this should not fire. Skip rather than diff.
-            MESSAGE("DuckDB raised (skipped, not a diff): " << e.what());
+            // The generated grammar is raise-free by design, so a DuckDB raise
+            // here is a renderer/oracle regression: FAIL LOUDLY. Silently skipping
+            // would demote the suite to reference-only with CI green (audit C3).
+            FAIL("DuckDB raised on a grammar-safe generated case -- renderer/oracle regression, not a divergence: " << std::string(e.what()));
         }
     }
     return ref;  // equal
@@ -124,4 +125,34 @@ TEST_CASE("edge: explicit all-pass, all-fail, and null-laden columns") {
         q.projections.push_back({"p2", col(Type::F64, 1)});
         for (std::size_t bs : kBatchSizes) CHECK(diff_all(t, q, bs).equal);
     }
+}
+
+// Audit C3 anti-silent-degradation smoke: when the amalgamation is staged, PROVE
+// DuckDB genuinely executes end-to-end (load, run, read back) on generated-grammar
+// queries. Without this, a regression that made every rendered statement raise
+// would silently demote the whole suite to reference-only while staying green —
+// exactly the "checker that cannot fail" RIGOR.md rule 4 forbids. When DuckDB is
+// not staged, WARN loudly so a green log records that this run was reference-only.
+TEST_CASE("oracle smoke: DuckDB genuinely executes when staged") {
+    if (!duckdb_available()) {
+        WARN_MESSAGE(false,
+                     "DuckDB amalgamation NOT staged -- this whole run is "
+                     "REFERENCE-ONLY (stage third_party/duckdb/ to restore the "
+                     "authoritative differential)");
+        return;
+    }
+    std::mt19937_64 rng(qe::test::seed() ^ 0xD0C4D0C4u);
+    int nonempty_runs = 0;
+    for (int iter = 0; iter < 5; ++iter) {
+        const Schema schema = gen_schema(rng);
+        const Table table = gen_table(rng, schema);
+        const LogicalQuery query = gen_query(rng, schema);
+        ResultSet r;
+        REQUIRE_NOTHROW(r = run_duckdb(table, query));
+        if (table.num_rows() > 0) ++nonempty_runs;
+        const DiffResult d = run_differential(table, query, run_duckdb, 256);
+        CHECK_MESSAGE(d.equal, "smoke iter=" << iter << ": " << d.message);
+    }
+    // At least one round-trip must have moved real rows through DuckDB.
+    CHECK(nonempty_runs > 0);
 }
