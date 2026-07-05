@@ -50,9 +50,15 @@ int cell_order(const Cell& a, const Cell& b, Type t) {
     if (a.is_null != b.is_null) return a.is_null ? -1 : 1;
     if (a.is_null) return 0;
     if (t == Type::F64) {
+        // NaN-greatest total order (audit C2/H7): with raw <,> a NaN compared
+        // "equal" to every value, breaking std::sort's strict-weak-ordering
+        // precondition (UB) precisely when an engine bug produced a NaN — the
+        // comparator must be robust to the bugs it exists to catch.
+        const bool na = std::isnan(a.f), nb = std::isnan(b.f);
+        if (na || nb) return (na == nb) ? 0 : (na ? 1 : -1);
         if (a.f < b.f) return -1;
         if (a.f > b.f) return 1;
-        return 0;  // equal or both NaN (NaN excluded by WP-3 generators)
+        return 0;
     }
     if (t == Type::STR) {  // WP-7b: lexicographic by VALUE
         if (a.s < b.s) return -1;
@@ -77,6 +83,10 @@ void canonicalize(ResultSet& rs) {
 
 bool float_eq(double a, double b) {
     if (std::isnan(a) && std::isnan(b)) return true;
+    // Exact equality first: also the ±inf case, where a-b below would be NaN
+    // and equal infinities would spuriously mismatch (found by the audit-C2
+    // NaN/inf sort coverage — the all-finite generators never exercised inf).
+    if (a == b) return true;
     const double diff = std::fabs(a - b);
     return diff <= kAbsEps + kRelEps * std::max(std::fabs(a), std::fabs(b));
 }
