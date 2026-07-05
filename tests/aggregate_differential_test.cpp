@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <vector>
 
 #include "doctest/doctest.h"
@@ -46,7 +47,7 @@ DiffResult diff_all(const Table& t, const LogicalQuery& q, std::size_t bs) {
             DiffResult d = run_differential(t, q, run_duckdb, bs);
             if (!d.equal) return d;
         } catch (const DuckDBError& e) {
-            MESSAGE("DuckDB raised (skipped, not a diff): " << e.what());
+            FAIL("DuckDB raised on a grammar-safe generated case -- renderer/oracle regression, not a divergence: " << std::string(e.what()));
         }
     }
     return ref;
@@ -191,5 +192,46 @@ TEST_CASE("edge: empty input — global => 1 row, keyed => 0 rows") {
         LogicalQuery q;
         q.group_by = GroupBy{{0}, {AggSpec::count_star("cs"), AggSpec::sum(0, "s0")}};
         for (std::size_t bs : kBatchSizes) CHECK(diff_all(table, q, bs).equal);
+    }
+}
+
+TEST_CASE("edge: NaN values in F64 MIN/MAX/SUM/AVG (NaN-greatest total order)") {
+    // Audit C2: DuckDB orders NaN greater than every other double, so
+    //   MIN(group) is NaN only when every non-NULL input is NaN,
+    //   MAX(group) is NaN as soon as any non-NULL input is NaN,
+    //   SUM/AVG poison to NaN (IEEE), which float_eq treats as equal-to-NaN.
+    // Pre-fix, raw std::min/max silently dropped NaNs (an all-NaN group emitted
+    // the +/-inf identity) and the vector kernel was ISA-dependent.
+    const double qnan = std::numeric_limits<double>::quiet_NaN();
+    Schema s;
+    s.fields.emplace_back("c0", Type::I32);
+    s.fields.emplace_back("c1", Type::F64);
+    // key 1: {NaN, 1.5}   -> MIN 1.5,  MAX NaN
+    // key 2: {NaN, NaN}   -> MIN NaN,  MAX NaN   (the pre-fix +inf bug case)
+    // key 3: {2.5, 3.5}   -> MIN 2.5,  MAX 3.5   (NaN-free control)
+    // key 4: {NaN, NULL}  -> MIN NaN,  MAX NaN   (NULL ignored, not folded)
+    std::vector<std::int32_t> k = {1, 1, 2, 2, 3, 3, 4, 4};
+    std::vector<double> f = {qnan, 1.5, qnan, qnan, 2.5, 3.5, qnan, 0.0};
+    std::vector<OwnedColumn> cols;
+    cols.push_back(i32_col(k));
+    cols.push_back(f64_col(f, /*nulls=*/{7}));
+    const Table t(s, std::move(cols));
+
+    std::vector<AggSpec> aggs;
+    aggs.push_back(AggSpec::min(1, "mn"));
+    aggs.push_back(AggSpec::max(1, "mx"));
+    aggs.push_back(AggSpec::sum(1, "sm"));
+    aggs.push_back(AggSpec::avg(1, "av"));
+    aggs.push_back(AggSpec::count(1, "ct"));
+
+    SUBCASE("grouped") {
+        LogicalQuery q;
+        q.group_by = GroupBy{{0}, aggs};
+        for (std::size_t bs : kBatchSizes) CHECK(diff_all(t, q, bs).equal);
+    }
+    SUBCASE("global (kernel path)") {
+        LogicalQuery q;
+        q.group_by = GroupBy{{}, aggs};
+        for (std::size_t bs : kBatchSizes) CHECK(diff_all(t, q, bs).equal);
     }
 }

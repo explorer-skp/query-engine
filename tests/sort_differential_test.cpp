@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "doctest/doctest.h"
@@ -54,7 +55,7 @@ DiffResult diff_all(const Table& t, const LogicalQuery& q, std::size_t bs) {
             DiffResult d = run_differential(t, q, run_duckdb, bs);
             if (!d.equal) return d;
         } catch (const DuckDBError& e) {
-            MESSAGE("DuckDB raised (skipped, not a diff): " << e.what());
+            FAIL("DuckDB raised on a grammar-safe generated case -- renderer/oracle regression, not a divergence: " << std::string(e.what()));
         }
     }
     return ref;
@@ -152,4 +153,43 @@ TEST_CASE("edge: ORDER BY on a GROUP BY result (keys then aggregate)") {
         SortKey{1, SortDir::Desc, NullOrder::Last},
         SortKey{0, SortDir::Asc, NullOrder::Last}};
     for (std::size_t bs : kBatchSizes) CHECK(diff_all(t, q, bs).equal);
+}
+
+TEST_CASE("edge: NaN in an F64 sort key (NaN-greatest, all directions)") {
+    // Audit C2: DuckDB orders NaN greater than every non-NaN double; the engine
+    // comparator now implements the same TOTAL order (pre-fix, NaN keys made the
+    // comparator non-strict-weak — std::stable_sort UB). The unique I64 column
+    // is appended as a tiebreaker so the positional compare is deterministic
+    // (all NaNs tie with each other).
+    using namespace qe::ops_test;
+    const double qnan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    Schema s;
+    s.fields.emplace_back("c0", Type::F64);
+    s.fields.emplace_back("c1", Type::I64);
+    std::vector<double> f = {qnan, 2.0, -inf, qnan, 0.5, inf, -3.5, qnan, 7.25};
+    std::vector<OwnedColumn> cols;
+    cols.push_back(f64_col(f, /*nulls=*/{4}));  // one NULL among the NaNs
+    {
+        OwnedColumn c = OwnedColumn::make(Type::I64, f.size());
+        auto* d = reinterpret_cast<std::int64_t*>(c.mutable_data());
+        for (std::size_t i = 0; i < f.size(); ++i) d[i] = static_cast<std::int64_t>(i);
+        cols.push_back(std::move(c));
+    }
+    const Table t(s, std::move(cols));
+    for (auto dir : {SortDir::Asc, SortDir::Desc})
+        for (auto no : {NullOrder::First, NullOrder::Last}) {
+            LogicalQuery q;
+            q.projections.push_back({"p0", qe::expr::col(Type::F64, 0)});
+            q.projections.push_back({"p1", qe::expr::col(Type::I64, 1)});
+            q.order_by = std::vector<SortKey>{
+                SortKey{0, dir, no},
+                SortKey{1, SortDir::Asc, NullOrder::Last}};  // unique tiebreaker
+            for (std::size_t bs : kBatchSizes) {
+                const DiffResult d = diff_all(t, q, bs);
+                CHECK_MESSAGE(d.equal, "dir=" << std::string(dir == SortDir::Asc ? "ASC" : "DESC")
+                                              << " nulls=" << std::string(no == NullOrder::First ? "FIRST" : "LAST")
+                                              << " bs=" << bs << " : " << d.message);
+            }
+        }
 }

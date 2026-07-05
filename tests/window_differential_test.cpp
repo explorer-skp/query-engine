@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "doctest/doctest.h"
@@ -70,7 +71,7 @@ DiffResult diff_one(const Plan& p, std::size_t bs) {
             DiffResult d = run_plan_differential(p, run_plan_duckdb, bs);
             if (!d.equal) return d;
         } catch (const DuckDBError& e) {
-            MESSAGE("DuckDB raised (skipped, not a diff): " << e.what());
+            FAIL("DuckDB raised on a grammar-safe generated case -- renderer/oracle regression, not a divergence: " << std::string(e.what()));
         }
     }
     return ref;
@@ -244,4 +245,68 @@ TEST_CASE("WP-13 edge: I32 timestamp, composite key tumbling") {
     CHECK(diff_all_batches(window_plan(in, tsx::WindowMode::Sliding, k01, 2, 1,
                                        {AggSpec::count_star("n"),
                                         AggSpec::max(3, "mx")})));
+}
+
+TEST_CASE("WP-13 edge: NaN values in F64 MIN/MAX (tumbling + sliding)") {
+    // Audit C2: both window modes must implement the NaN-greatest total order
+    // (MIN NaN only for an all-NaN frame/bucket, MAX NaN when any NaN present).
+    // Pre-fix, tumbling emitted +/-inf for all-NaN buckets while sliding's deque
+    // was ORDER-DEPENDENT ({3.0,NaN} vs {NaN,3.0} gave different MINs) — the two
+    // modes disagreed with each other and both diverged from DuckDB.
+    const double qnan = std::numeric_limits<double>::quiet_NaN();
+    Schema s;
+    s.fields.emplace_back("c0", Type::I32);   // key
+    s.fields.emplace_back("c1", Type::TS);    // time
+    s.fields.emplace_back("c2", Type::F64);   // value with NaNs
+    std::vector<OwnedColumn> cols;
+    cols.push_back(i32_col({1, 1, 1, 1, 2, 2, 2, 2}));
+    {
+        OwnedColumn t = OwnedColumn::make(Type::TS, 8);
+        auto* d = reinterpret_cast<std::int64_t*>(t.mutable_data());
+        const std::int64_t tv[] = {0, 5, 12, 17, 1, 6, 11, 21};
+        for (int i = 0; i < 8; ++i) d[i] = tv[i];
+        cols.push_back(std::move(t));
+    }
+    // key 1: {3.0, NaN | NaN, NaN}  -- mixed bucket then all-NaN bucket
+    // key 2: {NaN, 2.0 | NULL, 4.0} -- NaN-first ordering + a NULL among values
+    cols.push_back(f64_col({3.0, qnan, qnan, qnan, qnan, 2.0, 0.0, 4.0},
+                           /*nulls=*/{6}));
+    const Table in(s, std::move(cols));
+    const std::vector<std::uint32_t> k0{0};
+    const std::vector<AggSpec> mm{AggSpec::min(2, "mn"), AggSpec::max(2, "mx"),
+                                  AggSpec::count(2, "ct")};
+    CHECK(diff_all_batches(window_plan(in, tsx::WindowMode::Tumbling, k0, 1, 10, mm)));
+    for (std::int64_t P : {1, 2, 7})  // frame sizes cut the NaN runs differently
+        CHECK(diff_all_batches(window_plan(in, tsx::WindowMode::Sliding, k0, 1, P, mm)));
+}
+
+TEST_CASE("WP-13 edge: NULL timestamp in a sliding window (NULLS LAST, all backends)") {
+    // Audit H1/H2: the engine sorts the sliding input NULLS LAST, the rendered
+    // OVER clause now says ASC NULLS LAST explicitly (no DuckDB session-default
+    // reliance), and the reference no longer reads a NULL ts as t=0 (which used
+    // to sort it mid-partition and shift every straddling frame). One NULL ts
+    // per partition keeps the tie order deterministic across all three backends
+    // (positional ROWS frames on tied keys are otherwise nondeterministic).
+    Schema s;
+    s.fields.emplace_back("c0", Type::I32);   // key
+    s.fields.emplace_back("c1", Type::TS);    // time (one NULL per partition)
+    s.fields.emplace_back("c2", Type::I64);   // value
+    std::vector<OwnedColumn> cols;
+    cols.push_back(i32_col({1, 1, 1, 1, 2, 2, 2}));
+    {
+        OwnedColumn t = OwnedColumn::make(Type::TS, 7);
+        auto* d = reinterpret_cast<std::int64_t*>(t.mutable_data());
+        const std::int64_t tv[] = {5, 0, 0 /*NULL*/, 12, 3, 0 /*NULL*/, 9};
+        for (int i = 0; i < 7; ++i) d[i] = tv[i];
+        t.set_null(2);
+        t.set_null(5);
+        cols.push_back(std::move(t));
+    }
+    cols.push_back(i64_col_local({10, 20, 30, 40, 50, 60, 70}));
+    const Table in(s, std::move(cols));
+    const std::vector<std::uint32_t> k0{0};
+    const std::vector<AggSpec> aggs{AggSpec::count_star("n"), AggSpec::sum(2, "s"),
+                                    AggSpec::min(2, "mn"), AggSpec::avg(2, "av")};
+    for (std::int64_t P : {1, 3})
+        CHECK(diff_all_batches(window_plan(in, tsx::WindowMode::Sliding, k0, 1, P, aggs)));
 }
