@@ -9,6 +9,7 @@
 //  isolates that defect.
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +23,21 @@
 #include "ops/aggregate.h"  // AggFunc, AggSpec, agg_result_type
 
 namespace qe::ops::detail {
+
+// F64 TOTAL-ORDER POLICY for MIN/MAX (matches DuckDB): NaN is GREATER than every
+// other double (all NaNs tie). So MIN returns NaN only when every non-NULL input
+// is NaN, and MAX returns NaN when any non-NULL input is NaN. This replaces raw
+// std::min/std::max, whose NaN behavior silently drops NaNs, is position-
+// dependent, and (in the Highway kernels) differs between NEON and AVX — the
+// exact ISA-divergence audit finding C2. Under this order the MIN identity is
+// NaN (the greatest element) and the MAX identity stays -inf.
+inline bool f64_less_total(double a, double b) {
+    if (std::isnan(b)) return !std::isnan(a);  // anything real < NaN; NaN !< NaN
+    if (std::isnan(a)) return false;           // NaN !< real
+    return a < b;
+}
+inline double f64_min_total(double a, double b) { return f64_less_total(b, a) ? b : a; }
+inline double f64_max_total(double a, double b) { return f64_less_total(a, b) ? b : a; }
 
 // Per-group, per-aggregate accumulator. `cnt` is the COUNT(*) row count for a
 // CountStar agg, otherwise the NON-NULL input count (drives COUNT(col), the
@@ -42,13 +58,16 @@ inline bool agg_is_float(const AggSpec& s, Type input_type) {
 }
 
 // A fresh accumulator for a brand-new group: zero for COUNT/SUM/AVG, the
-// op-identity (so a real value always wins) for MIN/MAX.
+// op-identity (so a real value always wins) for MIN/MAX. Under the NaN-greatest
+// total order the F64 MIN identity is NaN, not +inf: an all-NaN group must emit
+// NaN (as DuckDB does), and every real value still beats the identity because
+// f64_min_total picks it over NaN.
 inline AggCell init_agg_cell(AggFunc func, bool is_float) {
     AggCell c;  // i=0, d=0, cnt=0
     switch (func) {
         case AggFunc::Min:
             c.i = std::numeric_limits<std::int64_t>::max();
-            c.d = std::numeric_limits<double>::infinity();
+            c.d = std::numeric_limits<double>::quiet_NaN();
             break;
         case AggFunc::Max:
             c.i = std::numeric_limits<std::int64_t>::min();
