@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 #include <memory>
 #include <utility>
 
@@ -44,12 +45,22 @@ namespace {
 // ids in place of STR — matches by value. Feeding the raw codes instead (the
 // planted mutant) misses every cross-dictionary match. Validity is preserved (a
 // NULL key stays NULL -> NullPolicy::kNeverMatch, never joins).
-OwnedColumn canonicalize_str_key_to_i32(const Column& src, StringDict& idmap) {
+OwnedColumn canonicalize_str_key_to_i32(const Column& src,
+                                        const SelectionVector* sel,
+                                        StringDict& idmap) {
     const std::size_t len = src.len;
     OwnedColumn out = OwnedColumn::make(Type::I32, len);
     auto* ids = reinterpret_cast<std::int32_t*>(out.mutable_data());
     const auto* codes = reinterpret_cast<const std::int32_t*>(src.data);
-    for (std::size_t p = 0; p < len; ++p) {
+    // Audit H3: touch ONLY the batch's live rows — unselected physical slots
+    // need not hold meaningful codes (Batch contract), so resolving them is UB
+    // and interning them pollutes the shared value-id dict. Physical layout is
+    // preserved (the batch's sel keeps indexing the output); dead slots get id
+    // 0 and are never read by any sel-aware consumer.
+    std::memset(ids, 0, len * sizeof(std::int32_t));
+    const std::size_t n = sel ? sel->len : len;
+    for (std::size_t k = 0; k < n; ++k) {
+        const std::size_t p = sel_at(sel, k);
         const bool valid = src.all_valid || validity::get_bit(src.validity, p);
         if (valid)
             ids[p] = idmap.intern(src.dict->at(codes[p]));
@@ -101,12 +112,14 @@ HashJoin::HashJoin(std::unique_ptr<Operator> probe,
     assert(!probe_keys_.empty() && "equi-join needs >=1 key");
     probe_schema_ = probe_->output_schema();
     build_schema_ = build_->output_schema();
-#ifndef NDEBUG
+    // Real check in EVERY build (audit H5): with NDEBUG the old assert vanished
+    // and a mismatched key pair (e.g. I32 probe vs I64 build) silently misread
+    // probe bytes at the build side's width — garbage matches, no diagnostic.
     for (std::size_t i = 0; i < probe_keys_.size(); ++i)
-        assert(probe_schema_.fields[probe_keys_[i]].second ==
-                   build_schema_.fields[build_keys_[i]].second &&
-               "join key column types must match positionally");
-#endif
+        if (probe_schema_.fields[probe_keys_[i]].second !=
+            build_schema_.fields[build_keys_[i]].second)
+            throw std::invalid_argument(
+                "HashJoin: join key column types must match positionally");
 }
 
 Schema HashJoin::output_schema() const {
@@ -160,7 +173,7 @@ void HashJoin::build_side() {
             const Column& col = b.cols[build_keys_[i]];
             if (st.key_id_maps[i]) {  // STR -> shared I32 value-ids
                 st.canon_keys.push_back(
-                    canonicalize_str_key_to_i32(col, *st.key_id_maps[i]));
+                    canonicalize_str_key_to_i32(col, b.sel, *st.key_id_maps[i]));
                 key_views.push_back(st.canon_keys.back().view());
             } else {
                 key_views.push_back(col);
@@ -202,7 +215,7 @@ bool HashJoin::build_pairs_for_probe() {
         const Column& col = b.cols[probe_keys_[i]];
         if (st.key_id_maps[i]) {  // STR -> SAME shared I32 value-ids as the build
             st.canon_keys.push_back(
-                canonicalize_str_key_to_i32(col, *st.key_id_maps[i]));
+                canonicalize_str_key_to_i32(col, b.sel, *st.key_id_maps[i]));
             st.key_views.push_back(st.canon_keys.back().view());
         } else {
             st.key_views.push_back(col);
