@@ -1,6 +1,6 @@
 //  FROZEN at WP-3. The universal pull-based operator contract — the substrate
 //  every operator (this WP's scan/filter/project and every later WP's
-//  aggregate/join/sort/asof/...) implements. Owned by the final review.
+//  aggregate/join/sort/asof/...) implements. Change only via an explicit ICR.
 //
 //  CONTRACT (frozen): the four pure-virtual methods below ARE the contract.
 //  Later WPs may not add to, rename, or retype this base interface without an

@@ -66,8 +66,8 @@ namespace qe::plan {
 // values/order byte-unchanged (verified at audit via `git diff`).
 // WP-13 (additive): Window is APPENDED after AsofJoin — every existing enumerator
 // keeps its value/order byte-unchanged. The enum is in-memory only and never
-// serialized; nothing relies on Window's integer value (the final review linearizes
-// it against any sibling Phase-2 enumerator at integration).
+// serialized; nothing relies on Window's integer value (sibling Phase-2
+// enumerators are linearized at integration).
 // WP-14 (additive): CompressedScan is APPENDED after Window — every existing
 // enumerator keeps its value/order byte-unchanged. The enum is in-memory only and
 // never serialized; nothing relies on CompressedScan's integer value.

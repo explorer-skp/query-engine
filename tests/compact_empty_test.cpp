@@ -7,7 +7,7 @@
 //  This is the BEFORE/AFTER regression: with the bug present these cases ABORT the
 //  process (ctest reports the crash as a failure); with the fix in place
 //  compact_column returns a valid, dense, all-valid EMPTY OwnedColumn of the right
-//  type and every CHECK below passes. Confirmed by the final review/worker by
+//  type and every CHECK below passes. Confirmed by
 //  reverting the one-line `if (n == 0) return out;` guard: the FIRST case aborts.
 //
 //  The fix is signature-preserving — only the body of compact_column changed; the

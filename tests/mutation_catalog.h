@@ -28,7 +28,7 @@
 namespace qe::catalog {
 
 // The §12 hazard classes the catalog must span (the "Planted-bug hotspots" list in
-// the final review brief, plus the two WP-9 carry-forwards). Used by the meta-test
+// the project design notes, plus the two WP-9 carry-forwards). Used by the meta-test
 // to assert coverage, not just a raw entry count.
 enum class Hazard : std::uint8_t {
     kSimdTailRemainder,        // SIMD tail/remainder past the last full vector

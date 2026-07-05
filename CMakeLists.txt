@@ -213,7 +213,7 @@ set_source_files_properties(
 # Highway directly and NOTHING from oracle/tests, so the from-scratch grep over tsx/
 # stays clean. Full -Wall -Wextra -Werror (no third-party headers).
 # WP-13 (additive) appends tsx/window.cpp to this existing source list (a sibling WP
-# also appends a source here — additive, the final review reconciles).
+# also appends a source here — additive, reconciled at integration).
 # WP-14 (additive) also appends the time-series codecs + compressed scan here. The
 # from-scratch codecs (Gorilla / delta-of-delta / zig-zag / varint) live in
 # tsx/compress.cpp; the lone vectorized decode step (zig-zag) is the Highway TU
@@ -311,7 +311,7 @@ if(EXISTS "${QE_DUCKDB_SRC}")
   # The oracle glue TU includes the vendored duckdb.hpp, whose own warnings would
   # trip the global -Werror (same rationale as the Highway/-w exemptions). Suppress
   # -Werror on just this TU so the third-party header can't fail our build.
-  # [reviewer integration fix at WP-3 DuckDB-staging; WP-3 worker to ratify.]
+  # [integration fix at WP-3 DuckDB-staging.]
   set_source_files_properties(oracle/duckdb_oracle.cpp PROPERTIES
     COMPILE_OPTIONS "-Wno-error")
 else()
