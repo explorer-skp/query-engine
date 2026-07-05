@@ -7,6 +7,8 @@
 #include <cassert>
 #include <cstdint>
 
+#include <new>
+
 #include "simd/aligned_alloc.h"
 
 namespace qe {
@@ -14,6 +16,11 @@ namespace qe {
 Buffer::Buffer(std::size_t nbytes) {
     if (nbytes == 0) return;
     data_ = static_cast<std::byte*>(simd::aligned_alloc_bytes(nbytes));
+    // Highway's allocator returns null on OOM AND on internal padding-arithmetic
+    // overflow. Silently keeping size_ = nbytes would break the class invariant
+    // (data()==nullptr implies size()==0) and defer the failure to a write
+    // through null with no diagnostic (audit H6).
+    if (data_ == nullptr) throw std::bad_alloc();
     size_ = nbytes;
     // The runtime-derived alignment contract must actually hold.
     assert(reinterpret_cast<std::uintptr_t>(data_) %
