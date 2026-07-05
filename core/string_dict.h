@@ -22,6 +22,7 @@
 //  Codes are assigned 0,1,2,... in first-seen order and never change.
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -50,9 +51,12 @@ class StringDict {
         return code;
     }
 
-    // The bytes of `code`. Precondition: 0 <= code < size().
+    // The bytes of `code`. Precondition: 0 <= code < size() (asserted in debug
+    // builds — a garbage code, e.g. from an uninitialized NULL lane, would
+    // otherwise read offsets_ out of bounds; audit H3).
     std::string_view at(std::int32_t code) const {
         const auto c = static_cast<std::size_t>(code);
+        assert(code >= 0 && c < size() && "StringDict::at: code out of range");
         const std::uint32_t lo = offsets_[c];
         const std::uint32_t hi = offsets_[c + 1];
         return std::string_view(bytes_.data() + lo, hi - lo);
