@@ -100,6 +100,13 @@ Batch OwnedBatch::view() const {
 
 OwnedColumn compact_column(const Column& in, const SelectionVector* sel,
                            std::size_t n) {
+    // The (all_valid=false, validity=nullptr) state is a documented precondition
+    // violation (core/column.h) — this is the debug backstop the header promises
+    // (audit: it was documented but never implemented; the else-branch below
+    // would otherwise silently PROMOTE such a column to all-valid, dropping
+    // every real null with no diagnostic).
+    assert((in.all_valid || in.validity != nullptr) &&
+           "Column with all_valid=false must carry a validity bitmap");
     OwnedColumn out = OwnedColumn::make(in.type, n);
     // WP-7b: STR compaction gathers the int32 codes (byte_width 4 -> the `case 4`
     // gather below) UNCHANGED, so they stay valid in the SAME dict; carry that dict
