@@ -26,6 +26,7 @@
 
 #include "bench_report.h"
 #include "bench_util.h"
+#include "validity_gate.h"
 #include "core/owned_batch.h"
 #include "core/types.h"
 #include "ops/table.h"
@@ -124,6 +125,21 @@ int main(int argc, char** argv) {
 
     MachineState machine = captureMachineState();
     machine.hwyTarget = qe::tools::dispatchedHighwayTarget();
+    // VALIDITY GATE (audit H9): this driver emits host+isa-tagged ratio JSON,
+    // so a contaminated run must be rejected, not reported — the same rule
+    // bench_ops/engine_vs_duckdb already enforce ("gate-checks before report").
+    const GateVerdict gate = evaluateGate(machine);
+    if (!gate.accepted) {
+        std::fprintf(stderr,
+                     "VALIDITY GATE: REJECTED — run is contaminated, numbers are "
+                     "NOT credible:\n");
+        for (const auto& r : gate.reasons)
+            std::fprintf(stderr, "    - %s\n", r.c_str());
+    } else {
+        std::fprintf(stderr,
+                     "VALIDITY GATE: accepted (loadavg/cpu=%.2f probe_spread=%.2f)\n",
+                     gate.loadavg_per_cpu, gate.probe_spread);
+    }
     std::string host = argValue(argc, argv, "--host", "");
     if (host.empty()) host =
 #if defined(__APPLE__)
@@ -160,6 +176,7 @@ int main(int argc, char** argv) {
     w.kv("kind", "bench_compress");
     w.kv("host", host);
     w.kv("isa", isa);
+    w.kv("gate_accepted", gate.accepted ? "true" : "false");
     w.kv("hwy_target", machine.hwyTarget);
     w.kv("seed", seed);
     w.kv("preliminary", true);  // §2: Mac/NEON dev number, relative-only
@@ -193,5 +210,5 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "failed to write %s\n", outPath.c_str());
         return 1;
     }
-    return 0;
+    return gate.accepted ? 0 : 3;
 }
