@@ -196,11 +196,27 @@ struct Acc {
     std::string s;
 };
 
+// F64 MIN/MAX fold under the NaN-greatest total order (DuckDB semantics, audit
+// C2), implemented INDEPENDENTLY of the engine's ops/agg_internal.h helpers so
+// engine-vs-reference stays a meaningful check on NaN inputs. MIN is NaN only
+// when every folded value is NaN (identity below is NaN); MAX is NaN as soon as
+// any folded value is NaN (identity stays -inf).
+double ref_min_f64(double a, double b) {
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    return b < a ? b : a;
+}
+double ref_max_f64(double a, double b) {
+    if (std::isnan(a) || std::isnan(b))
+        return std::numeric_limits<double>::quiet_NaN();
+    return b > a ? b : a;
+}
+
 Acc init_acc(AggFunc f) {
     Acc a;
     if (f == AggFunc::Min) {
         a.i = std::numeric_limits<std::int64_t>::max();
-        a.d = std::numeric_limits<double>::infinity();
+        a.d = std::numeric_limits<double>::quiet_NaN();  // NaN-greatest MIN identity
     } else if (f == AggFunc::Max) {
         a.i = std::numeric_limits<std::int64_t>::min();
         a.d = -std::numeric_limits<double>::infinity();
@@ -332,7 +348,7 @@ ResultSet run_reference_group_by(const Table& table, const LogicalQuery& q) {
                 case AggFunc::Min:
                     if (v.valid) {
                         if (is_float[a])
-                            acc.d = std::min(acc.d, v.d);
+                            acc.d = ref_min_f64(acc.d, v.d);
                         else
                             acc.i = std::min(acc.i, v.i);
                         ++acc.cnt;
@@ -341,7 +357,7 @@ ResultSet run_reference_group_by(const Table& table, const LogicalQuery& q) {
                 case AggFunc::Max:
                     if (v.valid) {
                         if (is_float[a])
-                            acc.d = std::max(acc.d, v.d);
+                            acc.d = ref_max_f64(acc.d, v.d);
                         else
                             acc.i = std::max(acc.i, v.i);
                         ++acc.cnt;
@@ -411,8 +427,8 @@ ResultSet run_reference_group_by(const Table& table, const LogicalQuery& q) {
 // (it compares already-materialized Cells), so "engine == reference" under ORDERED
 // compare is a meaningful check of the sort. std::stable_sort matches the engine's
 // stability on the child's (table/first-seen) row order; NULL placement is
-// ABSOLUTE (independent of ASC/DESC), and F64 uses IEEE order — the same contract
-// the engine's comparator and DuckDB obey.
+// ABSOLUTE (independent of ASC/DESC), and F64 uses the NaN-greatest total order
+// — the same contract the engine's comparator and DuckDB obey (audit C2).
 void apply_order_by(ResultSet& rs, const std::vector<SortKey>& keys) {
     std::stable_sort(
         rs.rows.begin(), rs.rows.end(),
@@ -426,8 +442,16 @@ void apply_order_by(ResultSet& rs, const std::vector<SortKey>& keys) {
                     return (k.nulls == NullOrder::First) ? a_null : !a_null;
                 }
                 int cmp;
-                if (rs.types[k.col] == Type::F64)
-                    cmp = (ca.f < cb.f) ? -1 : (ca.f > cb.f) ? 1 : 0;
+                if (rs.types[k.col] == Type::F64) {
+                    // NaN-greatest total order (audit C2), independent of the
+                    // engine's comparator. Raw <,> was not a strict weak
+                    // ordering for NaN keys (stable_sort UB).
+                    const bool na = std::isnan(ca.f), nb = std::isnan(cb.f);
+                    if (na || nb)
+                        cmp = (na == nb) ? 0 : (na ? 1 : -1);
+                    else
+                        cmp = (ca.f < cb.f) ? -1 : (ca.f > cb.f) ? 1 : 0;
+                }
                 else if (rs.types[k.col] == Type::STR)
                     cmp = ca.s.compare(cb.s);  // WP-7b: by value
                 else
@@ -878,11 +902,11 @@ ResultSet run_window_reference(const Table& input, qe::tsx::WindowMode mode,
                             if (is_float[a]) acc.d += v.d; else acc.i += v.i;
                             break;
                         case AggFunc::Min:
-                            if (is_float[a]) acc.d = std::min(acc.d, v.d);
+                            if (is_float[a]) acc.d = ref_min_f64(acc.d, v.d);
                             else acc.i = std::min(acc.i, v.i);
                             break;
                         case AggFunc::Max:
-                            if (is_float[a]) acc.d = std::max(acc.d, v.d);
+                            if (is_float[a]) acc.d = ref_max_f64(acc.d, v.d);
                             else acc.i = std::max(acc.i, v.i);
                             break;
                         default: break;
@@ -927,13 +951,18 @@ ResultSet run_window_reference(const Table& input, qe::tsx::WindowMode mode,
     const std::int64_t P = param;
     for (auto& [kt, rows] : parts) {
         (void)kt;
-        // Order the partition by timestamp ascending; original-index tiebreak makes
-        // it a stable TOTAL order (the generators keep per-partition ts distinct).
+        // Order the partition by timestamp ascending, NULL timestamps LAST —
+        // matching the engine's SortKey{time, Asc, NullOrder::Last} and DuckDB's
+        // window default. (Audit H1: reading .t of a NULL ts as 0 sorted the
+        // NULL row into the middle, shifting every straddling frame.) The
+        // original-index tiebreak keeps it a stable TOTAL order (generators
+        // keep per-partition ts distinct).
         std::stable_sort(rows.begin(), rows.end(),
                          [&](std::size_t x, std::size_t y) {
-                             const std::int64_t tx = read_ts(full.cols[time], x).t;
-                             const std::int64_t ty = read_ts(full.cols[time], y).t;
-                             if (tx != ty) return tx < ty;
+                             const RefTs tx = read_ts(full.cols[time], x);
+                             const RefTs ty = read_ts(full.cols[time], y);
+                             if (tx.valid != ty.valid) return tx.valid;
+                             if (tx.valid && tx.t != ty.t) return tx.t < ty.t;
                              return x < y;
                          });
         for (std::size_t p = 0; p < rows.size(); ++p) {
@@ -960,11 +989,11 @@ ResultSet run_window_reference(const Table& input, qe::tsx::WindowMode mode,
                                 else acc[a].i += v.i;
                                 break;
                             case AggFunc::Min:
-                                if (is_float[a]) acc[a].d = std::min(acc[a].d, v.d);
+                                if (is_float[a]) acc[a].d = ref_min_f64(acc[a].d, v.d);
                                 else acc[a].i = std::min(acc[a].i, v.i);
                                 break;
                             case AggFunc::Max:
-                                if (is_float[a]) acc[a].d = std::max(acc[a].d, v.d);
+                                if (is_float[a]) acc[a].d = ref_max_f64(acc[a].d, v.d);
                                 else acc[a].i = std::max(acc[a].i, v.i);
                                 break;
                             default: break;
