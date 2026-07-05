@@ -85,7 +85,30 @@ TEST_CASE("validity gate: a macOS-shaped quiet host checks only what it can") {
     CHECK_FALSE(hasReasonContaining(v, "governor"));
 }
 
+// ThreadSanitizer detection: TSan's runtime serializes and uniformly slows every
+// thread, which FLATTENS the very scheduling jitter the quiescence probe measures
+// (observed: spread 1.35 vs the 2.0 ceiling under `ctest --preset tsan`, a red CI
+// run — audit H10). The oversubscription case is a timing experiment, not a
+// data-race check, so under TSan it is skipped LOUDLY rather than left flaky.
+#if defined(__SANITIZE_THREAD__)
+#define QE_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define QE_UNDER_TSAN 1
+#endif
+#endif
+#ifndef QE_UNDER_TSAN
+#define QE_UNDER_TSAN 0
+#endif
+
 TEST_CASE("validity gate: deliberate oversubscription trips the quiescence probe") {
+    if (QE_UNDER_TSAN) {
+        WARN_MESSAGE(false,
+                     "skipped under ThreadSanitizer: TSan's uniform slowdown "
+                     "flattens the probe spread this case asserts on (run the "
+                     "release/asan presets for the real check)");
+        return;
+    }
     // Oversubscribe every logical core with spin loops, then run the probe under
     // contention: the per-rep spread must exceed the ceiling. This is the
     // portable signal that bites on macOS (and on any throttling host).
