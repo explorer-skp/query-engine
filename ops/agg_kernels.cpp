@@ -7,6 +7,9 @@
 
 #include "ops/agg_kernels.h"
 
+#include <cmath>
+#include <limits>
+
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "ops/agg_kernels.cpp"
 #include "hwy/foreach_target.h"  // IWYU pragma: keep
@@ -71,12 +74,61 @@ T MaxImpl(const T* v, std::size_t n) {
     return m;
 }
 
+// --- F64 MIN/MAX: NaN-greatest TOTAL order (DuckDB semantics, audit C2). Raw
+// hn::Min/hn::Max NaN behavior is ISA-DEPENDENT (NEON vminq returns NaN, x86
+// _mm_min_pd returns the second operand), so NaN lanes are masked to the op's
+// real-number identity BEFORE the lane op — every surviving lane is NaN-free and
+// the reduction is deterministic on every target. MIN returns NaN only when no
+// real (non-NaN) element exists; MAX returns NaN as soon as any NaN is seen.
+double MinF64Impl(const double* v, std::size_t n) {
+    const hn::ScalableTag<double> d;
+    const std::size_t lanes = hn::Lanes(d);
+    const auto inf = hn::Set(d, std::numeric_limits<double>::infinity());
+    auto acc = inf;
+    bool seen_real = false;
+    std::size_t k = 0;
+    for (; k + lanes <= n; k += lanes) {
+        const auto x = hn::LoadU(d, v + k);
+        const auto is_nan = hn::IsNaN(x);
+        if (!hn::AllTrue(d, is_nan)) seen_real = true;
+        acc = hn::Min(acc, hn::IfThenElse(is_nan, inf, x));
+    }
+    double m = hn::ReduceMin(d, acc);
+    for (; k < n; ++k) {
+        if (std::isnan(v[k])) continue;
+        if (!seen_real || v[k] < m) m = v[k];
+        seen_real = true;
+    }
+    return seen_real ? m : std::numeric_limits<double>::quiet_NaN();
+}
+
+double MaxF64Impl(const double* v, std::size_t n) {
+    const hn::ScalableTag<double> d;
+    const std::size_t lanes = hn::Lanes(d);
+    const auto ninf = hn::Set(d, -std::numeric_limits<double>::infinity());
+    auto acc = ninf;
+    bool seen_nan = false;
+    std::size_t k = 0;
+    for (; k + lanes <= n; k += lanes) {
+        const auto x = hn::LoadU(d, v + k);
+        const auto is_nan = hn::IsNaN(x);
+        if (!hn::AllFalse(d, is_nan)) seen_nan = true;
+        acc = hn::Max(acc, hn::IfThenElse(is_nan, ninf, x));
+    }
+    double m = hn::ReduceMax(d, acc);
+    for (; k < n; ++k) {
+        if (std::isnan(v[k])) { seen_nan = true; continue; }
+        if (v[k] > m) m = v[k];
+    }
+    return seen_nan ? std::numeric_limits<double>::quiet_NaN() : m;
+}
+
 std::int64_t SumI64(const std::int64_t* v, std::size_t n) { return SumImpl(v, n); }
 double SumF64(const double* v, std::size_t n) { return SumImpl(v, n); }
 std::int64_t MinI64(const std::int64_t* v, std::size_t n) { return MinImpl(v, n); }
 std::int64_t MaxI64(const std::int64_t* v, std::size_t n) { return MaxImpl(v, n); }
-double MinF64(const double* v, std::size_t n) { return MinImpl(v, n); }
-double MaxF64(const double* v, std::size_t n) { return MaxImpl(v, n); }
+double MinF64(const double* v, std::size_t n) { return MinF64Impl(v, n); }
+double MaxF64(const double* v, std::size_t n) { return MaxF64Impl(v, n); }
 
 }  // namespace HWY_NAMESPACE
 }  // namespace qe::ops
