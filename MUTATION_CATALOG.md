@@ -30,15 +30,22 @@ so "flagged"/"passes" is decided against DuckDB, not just the reference oracle.
 | 9 | `join_drop_probe_match` | join orchestration: dropped probe match | `mutant::HashJoin{kDropProbeMatch}` | join differential vs DuckDB (`join_mutation_test`) |
 | 10 | `sort_desc_as_asc` | sort orchestration: DESC sorted ASC | `mutant::Sort{kDescSortsAsc}` | **positional** differential vs DuckDB (`sort_mutation_test`) |
 | 11 | `agg_fold_null_in_sum` | aggregation orchestration: NULL folded as 0 in SUM | `mutant::Aggregate{kFoldNullInSum}` | group-by differential vs DuckDB (`agg_mutation_test`) |
-| 12 | `plan_drop_sort` | plan-lowering orchestration: dropped Sort | `plan::lower_mutant{kDropSort}` | **positional** plan differential vs DuckDB (`plan_mutation_test`) |
-| 13 | `asof_boundary_strict` | as-of orchestration: `>`-vs-`>=` boundary (drops equal-timestamp matches) | `tsx::mutant::AsofJoin{kBoundaryStrict}` | as-of differential vs DuckDB `ASOF JOIN` (`asof_mutation_test`) |
+| 12 | `agg_max_drops_nan` | aggregation orchestration: F64 MAX drops NaN (raw `std::max`) — **audit-C2 addition** | `mutant::Aggregate{kMaxDropsNan}` | group-by differential vs DuckDB (meta-test) |
+| 13 | `plan_drop_sort` | plan-lowering orchestration: dropped Sort | `plan::lower_mutant{kDropSort}` | **positional** plan differential vs DuckDB (`plan_mutation_test`) |
+| 14 | `asof_boundary_strict` | as-of orchestration: `>`-vs-`>=` boundary (drops equal-timestamp matches) | `tsx::mutant::AsofJoin{kBoundaryStrict}` | as-of differential vs DuckDB `ASOF JOIN` (`asof_mutation_test`) |
+| 15 | `window_frame_off_by_one` | window orchestration: sliding frame off by one | `tsx::mutant::Window{kFrameOffByOne}` | window differential vs DuckDB `OVER` (`window_mutation_test`) |
+| 16 | `compress_decode_drift` | compressed-scan orchestration: delta-of-delta decode drift | `tsx::mutant::CompressedScan{kDropSecondDerivative}` | compressed-scan differential vs DuckDB (`compress_mutation_test`) |
+| 17 | `parallel_merge_drop_partial` | parallel orchestration: cross-worker partial dropped in the merge | `mutant::ParallelEngine{kMergeDropPartial}` | parallel differential vs DuckDB, bites only at >1 worker (`wp10b_parallel_mutation_test`) |
+| 18 | `string_key_by_code` | STR keys hashed by raw dictionary code, not value | `mutant::StringKeyJoin{kHashRawCode}` | cross-dictionary join differential vs DuckDB VARCHAR (`wp7b_strings_mutation_test`) |
 
-Entries 6–8 are the **new WP-9 mutants** (`tests/catalog_mutants.*`); entry 8 is
-the WP-2 carry-forward ("float→int round via +0.5"). Entries 1–5 and 9–12
+Entries 6–8 are the **WP-9 mutants** (`tests/catalog_mutants.*`); entry 8 is
+the WP-2 carry-forward ("float→int round via +0.5"). Entries 1–5 and 9–13
 consolidate the per-WP mutants the earlier work packages shipped, each still also
-exercised by its own catching test (the right-hand column). **Entry 13 is the
-WP-12 (Phase-2) as-of-join addition** (`tsx/asof_mutants.*`) — appended without
-touching the existing rows; it represents the §5 as-of boundary hazard.
+exercised by its own catching test (the right-hand column). Entry 12 is the
+**audit-C2 NaN addition** (see below). **Entries 14–16 are the Phase-2
+additions** (WP-12 as-of, WP-13 window, WP-14 compression) and **17–18 the
+optional-scope additions** (WP-10b parallelism, WP-7b strings) — each appended
+without touching existing rows.
 
 ## Carry-forward fix (regression, not a survivable mutant)
 
@@ -63,7 +70,8 @@ complete planted-mutant set each per-WP test drives:
 - **hashtable** (`ops/hashtable_mutants.*`): `kSkipRehashOne`, `kFindStopEarly`
   — `hashtable_mutation_test`.
 - **aggregate** (`ops/aggregate_mutants.*`): `kFoldNullInSum`, `kEmptyGroupZero`,
-  `kGroupTailOffByOne` — `agg_mutation_test`.
+  `kGroupTailOffByOne`, `kMaxDropsNan` (audit C2) — `agg_mutation_test` +
+  meta-test.
 - **join** (`ops/join_mutants.*`): `kDropProbeMatch`, `kLeftWrongNull`,
   `kCompositeFirstKeyOnly`, `kFanoutTailOffByOne` — `join_mutation_test`.
 - **sort** (`ops/sort_mutants.*`): `kDescSortsAsc`, `kNullsFlipped`,
@@ -76,10 +84,18 @@ complete planted-mutant set each per-WP test drives:
   dropped final partial batch.
 - **WP-9 new** (`tests/catalog_mutants.*`): `cast_f64_to_i64_plus_half`,
   `sum_i64_wrapping_i32`, `gather_in_place_aliased`.
+- **window** (`tsx/window_mutants.*`, WP-13): `kFrameOffByOne`, `kBucketEdge`
+  — `window_mutation_test`.
+- **compress** (`tsx/compress_mutants.*`, WP-14): `kDropSecondDerivative`,
+  `kGorillaLeadingZerosOff` — `compress_mutation_test`.
+- **parallel** (`exec/parallel_mutants.*`, WP-10b): `kMergeDropPartial` —
+  `wp10b_parallel_mutation_test`.
+- **strings** (`ops/string_key_mutants.*`, WP-7b): `kHashRawCode` —
+  `wp7b_strings_mutation_test`.
 
 ## Reproduce
 
 ```bash
 cmake --preset asan && cmake --build build-asan --target mutation_catalog_meta_test -j8
-./build-asan/mutation_catalog_meta_test --seed 20260614        # all 12 flagged; engine passes
+./build-asan/mutation_catalog_meta_test --seed 20260614        # all 18 flagged; engine passes
 ```
