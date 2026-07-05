@@ -39,7 +39,7 @@ scan() {
 
   # (1) Forbidden #include in any source/header file.
   local inc
-  inc=$(grep -REn --include=\*.h --include=\*.hpp --include=\*.hh \
+  inc=$(grep -REin --include=\*.h --include=\*.hpp --include=\*.hh \
         --include=\*.hxx --include=\*.inc --include=\*.c --include=\*.cc \
         --include=\*.cpp --include=\*.cxx \
         "^[[:space:]]*#[[:space:]]*include[[:space:]]*[<\"][^>\"]*(${FORBIDDEN})" \
@@ -53,12 +53,53 @@ scan() {
   # (2) Forbidden link/find in any CMake under the module dirs (future-proofing:
   #     module dirs may gain their own CMakeLists in later WPs).
   local lnk
-  lnk=$(grep -REn --include=CMakeLists.txt --include=\*.cmake \
+  lnk=$(grep -REin --include=CMakeLists.txt --include=\*.cmake \
         "(target_link_libraries|link_libraries|find_package|FetchContent)[^#]*(${FORBIDDEN})" \
         "${existing[@]}" 2>/dev/null || true)
   if [[ -n "$lnk" ]]; then
     echo "FORBIDDEN LINK/FIND found in engine module CMake:" >&2
     echo "$lnk" >&2
+    hits=1
+  fi
+
+  # (3) Forbidden link on any ENGINE target in the ROOT CMakeLists.txt — where
+  #     every target in this repo is actually defined (audit H8: the scan above
+  #     only reads CMake files UNDER the module dirs, which contain none). A
+  #     whole-file grep would false-positive on the legitimate DuckDB links in
+  #     test/oracle targets, so this parses add_library/target_link_libraries
+  #     blocks and flags forbidden tokens only on targets whose sources live
+  #     under the module dirs.
+  local root_lnk
+  root_lnk=$(python3 - "$FORBIDDEN" "${MODULE_DIRS[@]}" <<'PY'
+import re, sys
+forb = re.compile(r'(?:' + sys.argv[1] + r')', re.I)
+dirs = tuple(d + '/' for d in sys.argv[2:])
+try:
+    text = open('CMakeLists.txt').read()
+except OSError:
+    sys.exit(0)
+blocks = re.findall(
+    r'(?m)^[ \t]*(add_library|target_link_libraries)\s*\(([^)]*)\)', text)
+engine = set()
+for cmd, body in blocks:
+    toks = body.split()
+    if cmd == 'add_library' and toks and any(
+            t.startswith(dirs) for t in toks[1:]):
+        engine.add(toks[0])
+hits = []
+for cmd, body in blocks:
+    toks = body.split()
+    if cmd == 'target_link_libraries' and toks and toks[0] in engine:
+        for t in toks[1:]:
+            if forb.search(t):
+                hits.append('CMakeLists.txt: engine target %s links forbidden %r'
+                            % (toks[0], t))
+print('\n'.join(hits))
+PY
+)
+  if [[ -n "$root_lnk" ]]; then
+    echo "FORBIDDEN LINK on an engine target in the root CMakeLists.txt:" >&2
+    echo "$root_lnk" >&2
     hits=1
   fi
 
@@ -88,7 +129,23 @@ self_test() {
 
   rm -f "$probe"
   trap - EXIT
-  echo "[self-test] 3/3 probe removed — re-scanning, expect CLEAN ..."
+
+  # Plant a forbidden LINK on an engine target in the root CMakeLists.txt (the
+  # branch audit H8 found unexercised) — expect the gate to bite, then restore.
+  echo "[self-test] 2b/3 planted forbidden root-CMake link — expect the gate to BITE ..."
+  cp CMakeLists.txt CMakeLists.txt.selftest_bak
+  # shellcheck disable=SC2064
+  trap "mv CMakeLists.txt.selftest_bak CMakeLists.txt" EXIT
+  printf '\ntarget_link_libraries(qe_core PRIVATE duckdb_amalg)\n' >> CMakeLists.txt
+  if scan; then
+    echo "[self-test] FAIL: gate did NOT catch the planted root-CMake link" >&2
+    exit 1
+  fi
+  echo "[self-test]   gate bit (nonzero) on the engine-target link."
+  mv CMakeLists.txt.selftest_bak CMakeLists.txt
+  trap - EXIT
+
+  echo "[self-test] 3/3 probes removed — re-scanning, expect CLEAN ..."
   if ! scan; then
     echo "[self-test] FAIL: tree not clean after removing the probe" >&2
     exit 1
