@@ -26,7 +26,8 @@ echo "==> [3/3] Highway integration smoke + provenance"
 cmake --build --preset release --target hwy_smoke host_state -j >/dev/null
 echo "--- hwy_smoke ---"
 ./build/hwy_smoke
-echo "--- host_state highway_target (must be a real target, not n/a-WP-H) ---"
-./build/hwy_smoke --target-only
+echo "--- host_state provenance JSON (highway_target must be real, not n/a-WP-H) ---"
+./build/host_state | tee /dev/stderr | grep -q '"highway_target": *"[^n]' \
+  || { echo "host_state provenance missing a real highway_target" >&2; exit 1; }
 
 echo "ci.sh: ALL GATES GREEN"

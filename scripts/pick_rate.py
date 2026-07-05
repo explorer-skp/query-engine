@@ -6,7 +6,10 @@ Usage: pick_rate.py RESULTS_DIR PREFIX   (e.g. open.base)
 
 Sustainable = the highest swept rate where every repeat stayed valid, abandoned
 nothing, achieved >= 99% of the offered rate, AND kept the CO-corrected
-intended-send p99 under 50 ms. The last clause matters: a bounded in-flight
+intended-send tail bounded: p99 <= 20 ms and p99.9 <= 50 ms. (The two
+thresholds were previously written in the swapped order — p99 <= 50 ms with
+p99.9 <= 20 ms — which made the documented p99 clause dead code, since
+p99.9 >= p99 always; audit fix.) The tail clauses matter: a bounded in-flight
 generator can keep pace with the offered rate while per-request queueing grows
 toward seconds, so rate fidelity alone does not mean "below the knee". The
 headline load is 70% of that sustainable rate (a stated,
@@ -36,8 +39,8 @@ def main() -> None:
             r.get("valid", False)
             and r.get("abandoned", 1) == 0
             and r.get("throughput_cps", 0.0) >= 0.99 * rate
-            and r.get("e2e_intended", {}).get("p99_ns", 1e18) <= 50e6
-            and r.get("e2e_intended", {}).get("p999_ns", 1e18) <= 20e6
+            and r.get("e2e_intended", {}).get("p99_ns", 1e18) <= 20e6
+            and r.get("e2e_intended", {}).get("p999_ns", 1e18) <= 50e6
             for r in runs
         )
         if ok:
