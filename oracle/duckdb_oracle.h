@@ -31,8 +31,9 @@ constexpr bool duckdb_available() {
 }
 
 // Thrown when DuckDB raises on a statement. Per the divergence policy the
-// generators never produce a raising query, so this is a defensive backstop: the
-// harness treats it as "regenerate this case", never as a silent diff.
+// generators never produce a raising query, so a raise is a renderer/oracle
+// REGRESSION: every generated-case harness FAILS on it (audit C3 — silently
+// skipping would demote the whole suite to reference-only with CI green).
 struct DuckDBError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };

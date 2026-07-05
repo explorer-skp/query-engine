@@ -9,6 +9,7 @@
 
 #ifdef QE_WITH_DUCKDB
 
+#include <cmath>
 #include <algorithm>
 #include <cstdint>
 #include <sstream>
@@ -45,10 +46,24 @@ std::string cell_literal(const OwnedColumn& oc, std::size_t r) {
             os << (reinterpret_cast<const std::uint8_t*>(c.data)[r] ? "TRUE"
                                                                     : "FALSE");
             break;
-        case Type::F64:
-            os.precision(17);
-            os << reinterpret_cast<const double*>(c.data)[r];
+        case Type::F64: {
+            const double d = reinterpret_cast<const double*>(c.data)[r];
+            // Non-finite doubles have no bare SQL literal ("nan" is a binder
+            // error) and a bare "-0" parses as INTEGER, losing the sign bit.
+            // Emit typed literals so the loaded value is bit-faithful (audit C2
+            // NaN coverage + minor -0.0 finding).
+            if (std::isnan(d)) {
+                os << "'NaN'::DOUBLE";
+            } else if (std::isinf(d)) {
+                os << (d > 0 ? "'Infinity'::DOUBLE" : "'-Infinity'::DOUBLE");
+            } else if (d == 0.0 && std::signbit(d)) {
+                os << "'-0'::DOUBLE";
+            } else {
+                os.precision(17);
+                os << d;
+            }
             break;
+        }
         case Type::STR: {
             // WP-7b: decode the dict code to its bytes and emit a single-quoted SQL
             // string literal (doubling embedded quotes) so DuckDB sees the real
