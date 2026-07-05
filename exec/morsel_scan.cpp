@@ -46,10 +46,15 @@ std::optional<Batch> MorselScan::next() {
     b.cols.reserve(table_.num_columns());
     for (std::size_t c = 0; c < table_.num_columns(); ++c) {
         const OwnedColumn& oc = table_.column(c);
-        Column view;
+        Column view{};
         view.type = oc.type();
         view.len = n;
         view.data = oc.data() + start * byte_width(oc.type());
+        // WP-7b: carry the STR dictionary into the batch view (nullptr for
+        // non-STR), exactly as ops/scan.cpp does. Omitting this line left
+        // view.dict indeterminate for STR columns — every downstream STR
+        // consumer then dereferenced a wild pointer (audit C1a).
+        view.dict = oc.dict();
         if (oc.all_valid()) {
             view.validity = nullptr;
             view.all_valid = true;
