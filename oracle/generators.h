@@ -7,7 +7,12 @@
 //  DuckDB RAISES but the engine yields NULL: div/mod-by-zero, out-of-range or
 //  non-finite float->int casts, and signed-integer overflow on +,-,*. We pick
 //  option (a) from the brief: CONSTRAIN GENERATION so these cases never arise, so
-//  DuckDB never raises and there is nothing to reconcile. Concretely:
+//  DuckDB never raises and there is nothing to reconcile. NaN COMPARISON
+//  semantics also diverge (engine IEEE vs DuckDB NaN=NaN / NaN-greatest — see
+//  expr/expr.h) and stay masked by the finite F64 domain here; NaN in
+//  AGGREGATION/SORT ordering, by contrast, is aligned with DuckDB (NaN-greatest
+//  total order, audit C2) and covered by hand differential cases + a catalog
+//  mutant, so widening this domain must keep expressions finite-only. Concretely:
 //    * Integer data and arithmetic are magnitude-bounded so +,-,* cannot overflow
 //      int32/int64 (kI32Abs, kI64Abs, multipliers <= kMulAbs, depth-limited).
 //    * No division/modulo is generated (also dodges DuckDB's `/` float-division

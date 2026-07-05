@@ -8,7 +8,7 @@
 //  the identical runner + comparator serve every backend:
 //    * run_vs_reference()  — the always-available independent reference oracle
 //      (oracle/reference_oracle.h). This is what CI runs today.
-//    * run_vs_duckdb()     — DuckDB SQL (oracle/sql_oracle.h), compiled only when
+//    * run_vs_duckdb()     — DuckDB SQL (oracle/duckdb_oracle.h), compiled only when
 //      the DuckDB amalgamation is staged (QE_WITH_DUCKDB). The AUTHORITATIVE
 //      golden model per decision D16; it plugs into this same runner.
 #pragma once

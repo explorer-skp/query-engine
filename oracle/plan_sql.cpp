@@ -296,7 +296,10 @@ std::string render_window(const PlanNode& n, Ctx& ctx) {
             over << (i ? ", " : "") << "o" << n.window_keys[i];
         over << " ";
     }
-    over << "ORDER BY " << ot << " ROWS BETWEEN " << n.window_param
+    // Explicit ASC NULLS LAST: DuckDB's default_null_order is a session
+    // setting, and sql_render.h promises ORDER BY never relies on a backend
+    // default (audit H2). Matches the engine's NullOrder::Last sliding sort.
+    over << "ORDER BY " << ot << " ASC NULLS LAST ROWS BETWEEN " << n.window_param
          << " PRECEDING AND CURRENT ROW)";
     const std::string over_clause = over.str();
 
