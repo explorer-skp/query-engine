@@ -17,6 +17,7 @@
 #include "ops/hashtable.h"
 
 #include <cassert>
+#include <stdexcept>
 
 #include "ops/hash_internal.h"
 
@@ -57,7 +58,11 @@ HashTable::HashTable(std::vector<Type> key_types, NullPolicy null_policy,
 }
 
 std::uint32_t HashTable::new_group_from(std::size_t k) {
-    assert(next_id_ != kNoGroup && "group id space exhausted");
+    // Real guard in EVERY build (audit H5): hashtable.h promises "a guarded
+    // error, not silent wraparound", but an assert vanishes under NDEBUG —
+    // and a wrapped id would alias group 0's state or masquerade as kNoGroup.
+    if (next_id_ == kNoGroup)
+        throw std::overflow_error("HashTable: group id space exhausted (2^32-1)");
     const std::uint32_t g = next_id_++;
     for (std::size_t j = 0; j < key_words_.size(); ++j) {
         key_words_[j].push_back(scratch_words_[j][k]);
